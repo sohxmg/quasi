@@ -1,0 +1,132 @@
+# Feynman-PRM phase-1 config.
+#
+# Strict-parsed (feynman_prm/config.py): an unknown or misspelled key is a HARD ERROR,
+# because "config value silently ignored, library default used" is old bug B4.
+#
+# Every TMD-derived number carries its provenance. Where CLAUDE.md and the TMD repo
+# disagree, the repo wins unless §7 states an explicit reasoned divergence.
+#
+# NOT config, because they must never vary (PLAN "Config"): fp32 distances (mandatory,
+# bug B10a), pad-to-batch-max, the separator-after-prompt, strip_step_prefix,
+# log_selection_sha, add_step_prefix at eval, report_math_leak_split, layer_norm on the
+# psi/phi hidden layers, and hidden_size (always read from the downloaded config.json).
+
+run:
+  name: phase1
+  out_dir: runs
+  seed: 42
+
+model:
+  name: Qwen/Qwen2.5-Math-1.5B-Instruct
+  lora:
+    r: 16
+    alpha: 16
+    dropout: 0.0                 # 7 Qwen2 attn+MLP projections. NEVER a head. §6.2, §14
+  gradient_checkpointing: true
+  attn_implementation: sdpa      # already a fused flash-family kernel. flash_attention_2 is
+                                 # selectable IF a cp312/cu128/sm_120 wheel ever installs -
+                                 # worth ~2% of FLOPs, not the lever (PLAN 4a). NO flash-attn dep.
+
+heads:
+  latent_dim: 512                # tmd get_config(). NOT 1536 -> that was ~80% symmetric (old R6)
+  hidden_dims: [512, 512, 512]   # networks.py:531-542
+  ensemble: false                # TMD uses 2 + min(); off per human call. §16.6
+  action_pool: mean              # mean | attention   (§6.4, §16.7)
+
+distance:
+  variant: full_mrn              # full_mrn | asym_only | iqe   (tmd.py:28-66)
+  components: 8                  # K, tmd get_config()
+
+data:
+  dir: data/processed
+  max_len: 1024                  # rows over this are DROPPED, never truncated (~0.05%, logged)
+  sep_token: "\n"                # asserted to be exactly one token id at load (§6.1)
+  prompt_format: raw             # raw (CRM-faithful) | chat (Qwen chat template)
+  n_questions: 23000             # x 4.33 seqs/question = ~100k seqs/epoch (NOT 9.18 - §11.1)
+  n_val_questions: 2000
+
+# ===================== THE ONE DISCOUNT (locked #9) =====================
+# Read in TWO places and it is the SAME number in both, exactly as in TMD:
+#   1. goal sampler  - datasets.py:263  how far ahead training goals are drawn
+#   2. backup gamma  - tmd.py:110       per-good-step cost = -log(discount)
+# Pick it on GOAL VARIETY alone (§4.5). Do NOT reintroduce a second key (§7.8).
+discount: 0.5                    # CHOSEN 2026-07-25. -log = 0.69315, 41.1% endings, 4.19 distinct
+                                 # 0.7 = sanctioned fallback (-log 0.35667, 55.0%, 3.45 distinct)
+                                 # NOT TMD's 0.99: 1.16 distinct goals = old root cause B
+
+sampling:
+  sequences_per_micro_batch: 56
+  max_correct_per_question: 4    # CAPS, not quotas: min(cap, available). median is 2. §4.2.1
+  max_incorrect_per_question: 3
+  nce_mask_same_traj: false      # locked #12 - we want the negatives
+  group_by_length: true          # ~60% -> ~10% padding, est. 4h -> 2h/epoch. Peak mem 9->12 GB,
+                                 # so the longest batch runs FIRST as a probe. false = spec order.
+                                 # Q stays ~12.9 and every §8.1.1 count holds either way (PLAN 4a).
+
+losses:
+  lambda_nce: 1.0                # (1) L_NCE   §7.2
+  lambda_i: 1.0                  # (2) L_I     §7.3  TMD puts invariance at 1.0, NOT under zeta
+  zeta: 0.05                     # (3) L_T     §7.4  weights the BACKUP ONLY - tmd.py:124
+  lambda_cf: 0.0                 # (4) L_CF    §7.5  data deferred (§2 #4)
+  lambda_step: 1.0               # (5) L_step  §7.6  carries correctness. not optional (§7.6.2)
+  nce_temperature: 1.0           # tmd.py:92 uses sqrt(512)=22.6; we diverge (bug B10a, §7.2).
+                                 # float, not a boolean - raise it if logit_std blows up
+  action_invariance:
+    mode: diagonal               # diagonal (TMD, tmd.py:100-105) | grid_within_question | grid_batch
+                                 # the grid modes exist only to reproduce §16.3's failure and they
+                                 # BREAK L_step (§7.6.5). grid_max_actions is hardcoded to 64 there.
+  step_loss:
+    margin_steps: 2.0            # m = margin_steps * (-log discount) = 1.38629 at 0.5. SCALE-FREE.
+                                 #   good step  Delta ~ -0.693  (set by L_T, not by m)
+                                 #   error step Delta_{z+1} >= 1.386 (set by m)
+                                 #   natural eval tau = midpoint ~ 0.347
+    pairing: boundary            # boundary (psi_z vs psi_{z+1}) | position_corrected | same_index
+                                 # z is 0-BASED (§6.1). The last two are §7.10 expansions, OFF.
+                                 # position_corrected needs margin_steps 2.0 -> 3.0 (§7.10).
+    exclude_recovery: false       # the 1.48% False->True trajectories (§16.15)
+  backup:
+    clip_t_steps: 28.5           # t = clip_t_steps * (-log discount). SCALE-FREE.
+                                 # 28.5 reproduces TMD's bare t=3.0 (tmd.py:363) at gamma=0.9
+                                 # -> t = 19.75 at 0.5, 10.17 at 0.7.  §7.4.3
+    diag_backup: 0.5             # tmd.py:364. weight on MATCHED (source, its own goal) pairs
+    goal_scope_ratio: 1.0        # OURS, no TMD counterpart. within the non-matched mass:
+                                 # 1.0 = whole batch (TMD-faithful) | 0.0 = same-question only
+                                 # BOTH terms are logged regardless - diagnostic #13, §7.4.2
+    stopgrad_psi_backup: false   # tmd.py:365. stops psi(g) inside Dist ONLY (tmd.py:111-112);
+                                 # Next is stop-gradded unconditionally either way (tmd.py:113)
+  stopgrad_phi_invariance: false # tmd.py:366
+
+train:
+  epochs: 1
+  grad_accum: 2                  # -> ~889 optimizer steps. ASSERTED at launch (§11.1).
+                                 # If GPU time is short cut n_questions, NEVER raise this alone.
+  lr_backbone: 9.0e-6
+  lr_heads: 3.0e-4               # fresh head params only
+  schedule: cosine
+  warmup_ratio: 0.03
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  bf16: true
+  log_every: 10
+  save_every: 250
+  max_steps: null                # dev/smoke override
+                                 # optimizer is torch AdamW with foreach=False, hardcoded:
+                                 # FusedAdam JIT-compiles against the system CUDA (bug B8) and
+                                 # the foreach path allocates a large fp32 transient (bug B9).
+
+goal_head:                       # ================= PHASE 2 (§7.7) =================
+  lr: 1.0e-3
+  epochs: 20
+  batch_size: 512
+  max_terminals_per_question: 8
+
+eval:
+  subsets: [gsm8k, math, olympiadbench, omnimath]
+  max_len: 2048                  # olympiadbench/omnimath run 8-9 steps on long problems;
+                                 # the truncation count is logged and >1% is a hard failure
+  batch_sequences: 16
+  skyline: true                  # labelled skyline only, never a reported result (§5.1, §9.5)
+
+log:
+  wandb: false
+  wandb_project: feynman-prm

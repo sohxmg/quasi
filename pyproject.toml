@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "feynman-prm"
+version = "0.1.0"
+description = "Step-level quasimetric process reward model for mathematical reasoning"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.8",
+    "transformers>=4.56",
+    "peft>=0.14",
+    "datasets>=3.5",
+    "accelerate>=1.4",
+    "pyyaml",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["feynman_prm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: requires a CUDA device and the real model (deselect with -m 'not gpu')",
+]
+filterwarnings = ["ignore::DeprecationWarning"]

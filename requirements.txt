@@ -1,0 +1,15 @@
+# Deliberately small. Nothing from CRM's stack survives: its pins (torch 2.6, vllm 0.8.2,
+# deepspeed, trl, flash-attn) have no cu128 build and so cannot run on sm_120 at all.
+torch>=2.8              # install from the cu128 index: REQUIRED for sm_120 (Blackwell)
+transformers>=4.56      # dtype= kwarg; torch_dtype= is deprecated and goes away in v5
+peft>=0.14
+datasets>=3.5
+accelerate>=1.4
+pyyaml
+numpy
+pandas
+pyarrow
+tqdm
+pytest
+# NOT: trl, verl, deepspeed, vllm, flash-attn, bitsandbytes, optimum, openrlhf
+# wandb is optional and imported lazily (log.wandb: true); it is not pinned here.
