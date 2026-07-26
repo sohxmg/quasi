@@ -1,2 +1,9 @@
 CLAUDE.md
 PLAN.md
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+runs/
+data/processed/
+wandb/

@@ -128,5 +128,7 @@ eval:
   skyline: true                  # labelled skyline only, never a reported result (§5.1, §9.5)
 
 log:
-  wandb: false
+  wandb: true                    # JSONL + console are still the source of truth (§8 of SETUP.md).
+                                 # `pip install wandb && wandb login` first: a missing package
+                                 # only warns on stderr and trains on regardless.
   wandb_project: feynman-prm

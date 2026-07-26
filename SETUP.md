@@ -49,6 +49,17 @@ pip install torch --index-url https://download.pytorch.org/whl/cu128
 cd /path/to/feynman-prm
 pip install -r requirements.txt
 pip install -e .
+
+# wandb ships in requirements.txt and log.wandb defaults to true, so log in ONCE here.
+# Skipping this makes every training launch fail immediately -- deliberately, see §6.
+wandb login
+```
+
+**Check the package resolves** (`pip install -e .` finds `feynman_prm/`; the directory name and
+the import name must match or nothing below runs):
+
+```bash
+python -c "import feynman_prm; print(feynman_prm.__file__)"
 ```
 
 **Check it:**
@@ -318,8 +329,14 @@ Three rules that are not negotiable:
 
 A config change invalidates checkpoints. Start a fresh `run.name`.
 
-`log.wandb: true` enables wandb if it is installed; JSONL + console always work and are the
-source of truth.
+`log.wandb` now defaults to **true**, and `wandb` is in `requirements.txt`. If it is missing or
+you are not logged in, the run **fails at launch** rather than warning to stderr and training on
+— see §2. Turn it off with `--set log.wandb=false`. JSONL + console always work either way and
+are the source of truth.
+
+Only per-step metrics reach wandb: every loss term and every §10 probe. The launch blocks, the
+memory probe, the init values and the gate results go through `logger.event()`, which writes
+`events.jsonl` and the console **only**. Read those in tmux; they will not be in the dashboard.
 
 ---
 

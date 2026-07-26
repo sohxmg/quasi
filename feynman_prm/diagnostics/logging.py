@@ -8,7 +8,6 @@ to be additive and their gradient scales are uncharacterised.
 from __future__ import annotations
 
 import json
-import sys
 import time
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -32,13 +31,21 @@ class RunLogger:
         self._t0 = time.time()
         self._wandb = None
         if use_wandb:
+            # `log.wandb: true` was asked for explicitly, so a missing package is a hard error.
+            # It used to warn on stderr and train on regardless -- three hours of GPU time with
+            # nothing in the dashboard and one line scrolled past in tmux. Same reasoning as the
+            # strict config parse: a silently ignored config value is old bug B4.
             try:
                 import wandb
+            except ImportError as exc:
+                raise RuntimeError(
+                    "log.wandb is true but wandb is not installed. Either "
+                    "`pip install wandb && wandb login`, or run with --set log.wandb=false "
+                    "(metrics.jsonl is written either way)."
+                ) from exc
 
-                self._wandb = wandb
-                wandb.init(project=wandb_project, name=run_name, config=dict(config or {}))
-            except ImportError:
-                print("[log] wandb requested but not installed; JSONL only", file=sys.stderr)
+            self._wandb = wandb
+            wandb.init(project=wandb_project, name=run_name, config=dict(config or {}))
 
     # ---- writing ----
 

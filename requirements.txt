@@ -11,5 +11,6 @@ pandas
 pyarrow
 tqdm
 pytest
+wandb                   # log.wandb defaults to true; RunLogger raises if it is missing.
+                        # metrics.jsonl + console remain the source of truth either way.
 # NOT: trl, verl, deepspeed, vllm, flash-attn, bitsandbytes, optimum, openrlhf
-# wandb is optional and imported lazily (log.wandb: true); it is not pinned here.
