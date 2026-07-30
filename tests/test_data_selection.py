@@ -44,6 +44,20 @@ def test_questions_group_by_exact_prompt():
     assert questions[0].trainable and not questions[1].trainable
 
 
+def test_a_recovery_ending_true_is_counted_as_a_disagreement_not_as_a_crash():
+    """The four rows of 422,407 whose last label is True after an earlier False (measured
+    2026-07-27). `all_labels_equals_last_label` must report them as a FRACTION -- as a boolean
+    `all()` it read 0.0 on the real run and looked like a dataset change. They stay incorrect
+    with `z` at the first False (§16.15), which is what every loss consumes."""
+    questions, _ = build_questions([_row("q1", ["a", "b", "c"], [T, F, T])])
+    stats = dataset_stats(questions)
+    assert stats["last_label_disagreements"] == 1
+    assert stats["all_labels_equals_last_label"] == 0.0
+    assert stats["recovery_fraction"] == 1.0
+    traj = questions[0].trajectories[0]
+    assert not traj.correct and traj.z == 1
+
+
 def test_stats_reproduce_the_measured_quantities():
     questions, _ = build_questions(
         [
@@ -55,7 +69,8 @@ def test_stats_reproduce_the_measured_quantities():
     stats = dataset_stats(questions)
     assert stats["questions"] == 2
     assert stats["trainable_questions"] == 1
-    assert stats["all_labels_equals_last_label"] == 1.0   # 100.0% in real data (§4.2)
+    assert stats["all_labels_equals_last_label"] == 1.0   # 99.999% in real data (§4.2)
+    assert stats["last_label_disagreements"] == 0
     assert stats["first_error_index_mean"] == 1.0
     assert stats["questions_ge2_correct"] == 0.0          # §16.16 / §4.2.1
 

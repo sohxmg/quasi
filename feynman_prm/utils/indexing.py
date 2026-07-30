@@ -48,8 +48,9 @@ def has_recovery(labels: Sequence[bool]) -> bool:
 
 
 def trajectory_is_correct(labels: Sequence[bool]) -> bool:
-    """`all(labels) == labels[-1]` holds for 100.0% of math-shepherd rows (§4.2), but we
-    compute `all()` rather than relying on it."""
+    """`all(labels) == labels[-1]` holds for 99.999% of math-shepherd rows -- 4 of 422,407
+    disagree, all of them `[T...T, F, T...T]` (counted 2026-07-27, §4.2). We compute `all()`
+    rather than relying on it, so those four are incorrect with `z` at their first False."""
     return bool(len(labels) > 0 and all(labels))
 
 

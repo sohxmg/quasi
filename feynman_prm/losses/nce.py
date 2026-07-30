@@ -36,6 +36,7 @@ def nce_loss(
     mask_same_traj: bool = False,
     row_traj: Tensor | None = None,
     goal_traj: Tensor | None = None,
+    SQ: Tensor | None = None,
 ) -> tuple[Tensor, dict[str, float]]:
     """Returns (loss, diagnostics). `Dist` is the shared (R, C) matrix from matrix.py."""
     R, C = Dist.shape
@@ -74,4 +75,37 @@ def nce_loss(
             "nce/categorical_accuracy_backward": float((predicted == pos_row).float().mean()),
             "nce/negatives_per_column": float(R - 1),
         }
+
+        # The same-question split -- the L_NCE counterpart of diagnostic #13, and the only way
+        # to read `nce/loss` correctly. The pool is ~R/Q same-question rows plus ~R(1-1/Q)
+        # cross-question ones, and those are two different problems: cross-question separation
+        # is what L_NCE is for, while same-question rows include states that are GENUINELY
+        # closer to the goal than the sampled positive (§16.4 -- goal at s_6, positive at s_3,
+        # and s_5 sits between them). So a chunk of the same-question mass is unlearnable by
+        # construction, and the loss floors at log(1 + same-question negatives) even with
+        # cross-question solved perfectly. Read `loss_cross_question` and
+        # `accuracy_within_question` -- NOT `nce/loss` -- to tell "still learning" from
+        # "at the floor". A falling `nce/loss` with Q rising is the task getting easier, not
+        # the model getting better.
+        if SQ is not None:
+            same_q_neg = SQ & neg_mask
+            cross_q_neg = (~SQ) & neg_mask
+            n_same = same_q_neg.sum(dim=0).float().mean()
+            info["nce/negatives_same_question"] = float(n_same)
+            info["nce/floor_same_question"] = float(torch.log1p(n_same))
+            if same_q_neg.any():
+                info["nce/logits_neg_same_question"] = float(logits[same_q_neg].mean())
+            if cross_q_neg.any():
+                info["nce/logits_neg_cross_question"] = float(logits[cross_q_neg].mean())
+            # The loss with same-question negatives removed: how much of the residual is
+            # cross-question discrimination that is still genuinely unsolved.
+            info["nce/loss_cross_question"] = float(
+                F.cross_entropy(logits.masked_fill(same_q_neg, float("-inf")).t(), pos_row)
+            )
+            # Ranking WITHIN the question, which is what L_T's ruler has to supply and what
+            # more training can actually move. Chance is 1 / (1 + negatives_same_question).
+            within = logits.masked_fill(~SQ, float("-inf"))
+            info["nce/accuracy_within_question"] = float(
+                (within.argmax(dim=0) == pos_row).float().mean()
+            )
     return loss, info

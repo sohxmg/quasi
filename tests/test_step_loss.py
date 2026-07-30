@@ -30,9 +30,11 @@ def _fixture(labels_incorrect, labels_correct=(True, True), qid="q"):
 
 
 def test_init_value_is_exactly_ln5(cfg):
-    """§18: at init Delta_{z+1} ~= 0, so L_step = -log sigma(-m) = log(1 + e^m) = ln 5 =
-    1.6094 at discount 0.5 / margin_steps 2. EXACT, not approximate -- if it is not 1.609 the
-    margin or the z indexing is wrong."""
+    """A FIXTURE IDENTITY, not the model's init value (§7.6.7). With every distance equal,
+    Delta_{z+1} = 0 and L_step = -log sigma(-m) = log(1 + e^m) = ln 5 = 1.6094 at discount
+    0.5 / margin_steps 2. Exact HERE -- if it is not 1.609 the margin or the z indexing is
+    wrong. On the real model Delta_{z+1} starts negative and L_step starts near 4; the GPU
+    probe asserts the softplus sandwich instead, never this level."""
     batch, terminal_traj, _ = _fixture([T, T, F, F])
     D_term = torch.full((batch.n_states, int(batch.traj_correct.sum())), 3.0)
     loss, info = step_loss(D_term, batch, terminal_traj, cfg)

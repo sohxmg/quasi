@@ -37,9 +37,16 @@ HEADLINE = [
     "backup/linear_branch_fraction",
     "step/loss",
     "step/delta_mean",
+    "good/loss",
+    "good/delta_mean",
+    "good/above_target_fraction",
     "probe02/delta_good_mean",
     "probe03/delta_bad_mean",
     "probe03/gap",
+    # The tail, not the mean (§7.12): the mean read +0.240 for a whole run while a third of
+    # good steps sat above tau and F1 capped at 0.456.
+    "probe14/delta_good_of_correct/frac_above_natural",
+    "probe14/delta_good_of_correct/p99",
     "probe14/delta_good_of_correct/positive_fraction",
     "probe01/distinct_goal_ratio",
     "probe04/symmetric_share",

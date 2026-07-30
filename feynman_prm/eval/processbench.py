@@ -29,6 +29,7 @@ from torch import Tensor
 from ..config import Config
 from ..data.collate import SequenceRow, collate
 from ..data.tokenize import SequenceTooLong, build_sequence, sep_token_id
+from ..diagnostics.logging import Progress
 from ..utils.indexing import predicted_label_from_deltas
 from .metrics import processbench_metrics, split_metrics
 
@@ -70,6 +71,7 @@ def score_samples(
     cfg: Config,
     device,
     goal_fn: Optional[Callable[[Tensor, Sequence[Sample]], Tensor]] = None,
+    label: str = "processbench",
 ) -> tuple[list[list[float]], dict[str, float]]:
     """Returns (per-sample Delta lists, counters). An over-length sample gets an empty Delta
     list, which predicts -1.
@@ -109,8 +111,10 @@ def score_samples(
             d = model.distance(states, goals[b].expand_as(states))          # (T+1,)
             deltas[sample_idx] = (d[1:] - d[:-1]).float().cpu().tolist()    # Delta_1..Delta_T
             counters["scored"] += 1
+        progress.advance(len(pending))
         pending.clear()
 
+    progress = Progress(f"score/{label}", len(samples))
     for i, sample in enumerate(samples):
         try:
             seq = build_sequence(
@@ -219,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
 
     for subset in cfg.eval.subsets:
         samples = load_processbench(subset)
-        deltas, counters = score_samples(model, tokenizer, samples, cfg, device)
+        deltas, counters = score_samples(model, tokenizer, samples, cfg, device, label=subset)
         assert_truncation_budget(counters, len(samples), subset)
         leaked = [bool(leak_map.get(s.id, False)) for s in samples] if subset == "math" else None
         results[subset] = evaluate_subset(deltas, samples, tau, leaked=leaked)
@@ -231,7 +235,8 @@ def main(argv: list[str] | None = None) -> int:
             if references:
                 goal_fn = reference_goal_fn(model, tokenizer, cfg, device, references)
                 sky_deltas, _ = score_samples(
-                    model, tokenizer, samples, cfg, device, goal_fn=goal_fn
+                    model, tokenizer, samples, cfg, device,
+                    goal_fn=goal_fn, label=f"{subset}-skyline",
                 )
                 results[f"{subset}_SKYLINE_not_a_result"] = {
                     **evaluate_subset(sky_deltas, samples, tau),

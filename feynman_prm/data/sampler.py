@@ -1,9 +1,15 @@
-"""Batch composition: the 56-sequence budget, the caps, and length-grouped ordering (§8.1).
+"""Batch composition: the 56-sequence budget, the padded-token cap, the caps, and
+length-grouped ordering (§8.1).
 
-The budget is a fixed number of SEQUENCES, not of questions. Per question take
-`min(4, k_c)` correct and `min(3, k_i)` incorrect -- CAPS, not quotas: only 20.0% / 29.5%
-of questions can fill them and the median question has 2 of each (§4.2.1). Q is whatever
-fills the budget, ~12.9 measured (§8.1.1).
+TWO budgets, and a batch is closed when it would break either: a count of SEQUENCES
+(`sequences_per_micro_batch`, 56) and a count of PADDED TOKENS (`max_padded_tokens`,
+32768, i.e. `len(batch) x max_len`). The token cap is a DIVERGENCE from §8.1's
+sequences-only budget, measured and adopted 2026-07-27 -- see `_fits` for why.
+
+Per question take `min(4, k_c)` correct and `min(3, k_i)` incorrect -- CAPS, not quotas:
+only 20.0% / 29.5% of questions can fill them and the median question has 2 of each
+(§4.2.1). Q is whatever fills the budget: ~12.9 in §8.1.1, 11.8 measured under the token
+cap (`scripts/batch_report.py`).
 
 **The rule for a question that does not fit** (§8.1 does not state it; PLAN 'Core design
 decisions' 4 decides it): if the next question's full allocation does not fit, emit the
@@ -89,6 +95,33 @@ def _allocate(slot: QuestionSlot, cfg: Config, rng: np.random.Generator) -> list
     return chosen
 
 
+def _fits(n_seqs: int, max_len: int, budget: int, token_cap: int) -> bool:
+    """Both budgets. The token cap exists because the sequence budget is the wrong unit.
+
+    A batch costs `len(batch) x max_len` on the GPU, not `len(batch)`. With
+    `group_by_length` on, that decouples the two hard: the median batch is 19,423 padded
+    tokens and the largest is 57,344 (56 sequences all at `data.max_len`), because row
+    lengths are heavily left-skewed -- p50 248, p90 514, only 0.7% above 896. The 57,344
+    bucket OOMed the PLAN 4a probe on a 15.46 GiB card; PLAN 4a's "peak 9->12 GB" was
+    computed off the MEAN batch and never covered the tail.
+
+    Lowering the sequence budget instead (SETUP.md:344) shrinks all 1,832 batches to fix
+    the 312 that are too big, and what it spends is L_NCE's negative pool: 28 sequences
+    halves R from 364 to 175 and Q from 12.6 to 6.0, taking L_step's within-question pairs
+    with it. The token cap costs 5% of the mean pool (364 -> 344) and NOTHING at the 10th
+    percentile (177 -> 176), because the thin-pool batches are the SHORT ones -- few tokens
+    per row means few steps per row means small R -- while the oversized batches are long
+    sequences, which carry the LARGEST pools. The cap trims only where there is pool to
+    spare. That is structural, not a lucky draw on this dataset, and it is the whole reason
+    the two knobs are not interchangeable. Numbers: `scripts/batch_report.py`.
+
+    32768 leaves ~4 GiB of headroom on a 16 GiB card. Raise it only against a re-run of
+    that script: 40960 measures ~13.4 GiB, which is inside the error bar of an estimate
+    calibrated on a single observed OOM.
+    """
+    return n_seqs <= budget and n_seqs * max_len <= token_cap
+
+
 def epoch_batches(
     rows: Sequence[SequenceRow],
     slots: Sequence[QuestionSlot],
@@ -96,15 +129,20 @@ def epoch_batches(
     epoch: int,
     rng: np.random.Generator,
 ) -> list[list[int]]:
-    """One epoch of micro-batches, each a list of row indices (<= the sequence budget).
+    """One epoch of micro-batches, each a list of row indices, under both budgets (`_fits`).
 
     With `group_by_length` the padding fraction falls from ~60% to ~10% (PLAN 4a), peak
     memory moves to the longest bucket, and batches become length-homogeneous -- which is
     mildly good for L_NCE (length stops being a shortcut cue) and mildly worse for gradient
-    diversity. `group_by_length: false` reproduces the spec-literal order; Q and every
-    §8.1.1 count are unchanged either way.
+    diversity. `group_by_length: false` reproduces the spec-literal order.
+
+    The token cap binds on ~17% of batches and leaves the other 83% exactly as the sequence
+    budget alone would have made them, so the §8.1.1 counts hold on the bulk of the epoch
+    and shift only where memory forces it. `batch_stats` logs the realised distribution --
+    read it, do not assume 56.
     """
     budget = cfg.sampling.sequences_per_micro_batch
+    token_cap = cfg.sampling.max_padded_tokens
     allocations = [(_allocate(slot, cfg, rng)) for slot in slots]
     order = list(rng.permutation(len(slots)))
 
@@ -113,15 +151,21 @@ def epoch_batches(
 
     batches: list[list[int]] = []
     current: list[int] = []
+    current_max = 0                 # the padded width of `current`, which the cap is against
     for qi in order:
         alloc = allocations[qi]
         if not alloc:
             continue
-        if len(current) + len(alloc) > budget:
+        alloc_max = max(rows[i].length for i in alloc)
+        if not _fits(len(current) + len(alloc), max(current_max, alloc_max), budget, token_cap):
             if current:
                 batches.append(current)
-            current = []
+            current, current_max = [], 0
+        # A question whose own allocation breaks a budget is still emitted whole, in a batch
+        # of its own: no question is ever split (PLAN 'Core design decisions' 4), and the
+        # config asserts max_padded_tokens is large enough that this cannot happen.
         current.extend(alloc)
+        current_max = max(current_max, alloc_max)
     if current:
         batches.append(current)
 
@@ -206,10 +250,19 @@ def batch_stats(batches: Sequence[Sequence[int]], rows: Sequence[SequenceRow]) -
     }
 
 
-def steps_report(n_sequences: int, cfg: Config) -> dict[str, float]:
-    """§11.1's arithmetic, for the launch assert."""
-    per_step = cfg.sampling.sequences_per_micro_batch * cfg.train.grad_accum
-    steps = math.floor(n_sequences / per_step)
+def steps_report(n_sequences: int, cfg: Config, n_batches: int | None = None) -> dict[str, float]:
+    """§11.1's arithmetic, for the launch assert.
+
+    Pass `n_batches` when the epoch has already been built: the sequence budget is only an
+    UPPER bound on a batch now that `max_padded_tokens` also binds (~51 of 56 realised), so
+    the budget-only form under-counts the steps a run will actually take. The budget-only
+    form is kept for the planning path, which has no batches yet.
+    """
+    if n_batches is not None:
+        steps = planned_optimizer_steps(n_batches, cfg.train.grad_accum)
+    else:
+        per_step = cfg.sampling.sequences_per_micro_batch * cfg.train.grad_accum
+        steps = math.floor(n_sequences / per_step)
     return {
         "sequences_per_epoch": n_sequences,
         "optimizer_steps": steps,

@@ -69,7 +69,11 @@ class FeynmanPRM(nn.Module):
     def hidden_states(self, input_ids: Tensor, attention_mask: Optional[Tensor]) -> tuple[Tensor, Tensor]:
         """(input embeddings, last hidden state). One embedding lookup, one LM forward."""
         emb = self.backbone.get_input_embeddings()(input_ids)
-        out = self.backbone(inputs_embeds=emb, attention_mask=attention_mask)
+        # `use_cache=False` explicitly: we never generate, so a DynamicCache is pure cost --
+        # 28 layers x 2 x 256 dims of K/V per token, ~0.9 GB at the §8.1 batch shape. Gradient
+        # checkpointing suppresses it as a side effect, which is exactly why it must not be
+        # left to gradient checkpointing.
+        out = self.backbone(inputs_embeds=emb, attention_mask=attention_mask, use_cache=False)
         return emb, out.last_hidden_state
 
     @property

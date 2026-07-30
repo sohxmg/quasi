@@ -30,6 +30,16 @@ def _rows(spec: list[tuple[str, int, int]]):
     return rows
 
 
+def _sized(cfg, rows, **sampling):
+    """A config whose `data.max_len` matches these synthetic rows, so the token cap's
+    one-question floor (§8.1) is checked against the fixture and not against the real 1024."""
+    return dataclasses.replace(
+        cfg,
+        data=dataclasses.replace(cfg.data, max_len=max(r.length for r in rows)),
+        sampling=dataclasses.replace(cfg.sampling, group_by_length=False, **sampling),
+    )
+
+
 def test_caps_are_caps_not_quotas(cfg):
     """§4.2.1: only 20.0% of questions have >=4 correct and the median has 2, so a hard quota
     would discard most of the dataset. E[seqs] = min(4,k_c) + min(3,k_i) = 4.33, NEVER
@@ -106,6 +116,49 @@ def test_longest_batch_is_identifiable_for_the_memory_probe(cfg):
     rows = [synthetic_row("a", [T, T], step_len=2), synthetic_row("b", [T, T], step_len=50)]
     batches = [[0], [1]]
     assert longest_batch_index(batches, rows) == 1
+
+
+def test_the_token_cap_bounds_the_padded_shape(cfg):
+    """The budget the PLAN 4a probe actually cares about: a batch costs len(batch) x max_len,
+    not len(batch). The 2026-07-26 OOM was 56 sequences all at data.max_len = 57,344 tokens
+    on a 15.46 GiB card, which the sequence budget alone permits."""
+    rows = [synthetic_row(f"q{i}", [T, T] if k < 4 else [T, F], step_len=2 + 10 * (i % 3))
+            for i in range(20) for k in range(7)]
+    slots = build_question_slots(rows)
+    cap = 12 * max(r.length for r in rows)
+
+    capped = _sized(cfg, rows, max_padded_tokens=cap)
+    batches = epoch_batches(rows, slots, capped, 0, np.random.default_rng(0))
+    assert max(len(b) for b in batches) < capped.sampling.sequences_per_micro_batch  # cap binds
+    for batch in batches:
+        assert len(batch) * max(rows[i].length for i in batch) <= cap
+    assert sum(len(b) for b in batches) == len(rows)      # nothing is dropped
+
+
+def test_the_token_cap_leaves_short_batches_alone(cfg):
+    """Why the cap and not a smaller sequence budget: it must bind ONLY where memory forces
+    it, so L_NCE's negative pool survives on the 83% of batches that were never too big."""
+    rows = _rows([(f"q{i}", 4, 3) for i in range(20)])
+    slots = build_question_slots(rows)
+    budget = cfg.sampling.sequences_per_micro_batch
+    # Exactly non-binding: no batch can reach the sequence budget AND exceed this.
+    generous = _sized(cfg, rows, max_padded_tokens=budget * max(r.length for r in rows))
+    enormous = _sized(cfg, rows, max_padded_tokens=100 * budget * max(r.length for r in rows))
+
+    batches = epoch_batches(rows, slots, generous, 0, np.random.default_rng(0))
+    assert batches == epoch_batches(rows, slots, enormous, 0, np.random.default_rng(0))
+    assert max(len(b) for b in batches) == budget         # the sequence budget still bound
+
+
+def test_the_token_cap_cannot_be_set_below_one_question(cfg):
+    """No question is ever split (PLAN 4), so a cap under one question's worst case would be
+    exceeded by single-question batches and would bound nothing. Fail at config time."""
+    from feynman_prm.config import ConfigError
+
+    with pytest.raises(ConfigError, match="max_padded_tokens"):
+        dataclasses.replace(
+            cfg, sampling=dataclasses.replace(cfg.sampling, max_padded_tokens=1024)
+        )
 
 
 def test_optimizer_step_arithmetic_matches_section_11_1(cfg):

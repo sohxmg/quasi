@@ -21,9 +21,23 @@ Equivalently this is Bradley-Terry on `Delta_{z+1}` -- the exact statistic §9.1
 No other phase-1 loss touches it, and §7.6.2's gradient table shows it is the only term that
 trains psi AS A SOURCE.
 
-At init `Delta_{z+1} ~= 0`, so `L_step = -log sigma(-m) = ln 5 = 1.6094` at discount 0.5,
-margin_steps 2. **Exact, not approximate** -- if it is not 1.609 the margin or the z indexing
-is wrong.
+`ln 5` **is the FIXTURE value, not the model's** (corrected 2026-07-27, §7.6.7). It is
+`-log sigma(-m) = 1.6094`, which needs `Delta_{z+1} = 0` -- true only where every distance is
+equal, which tests/test_step_loss.py pins exactly and a real random psi does not give: LM
+hiddens are strongly anisotropic and `h_{s_0}` is the most atypical of them, so `psi_0` starts
+far from mid-solution states and `Delta_{z+1}` starts NEGATIVE wherever z = 0 (45.4% of
+incorrect trajectories). Measured: `Delta = -2.86, L_step = 4.26` on an all-z=0 fixture,
+`Delta = -0.44, L_step = 2.08` on the first real batch. **There is no single init level to
+quote and the earlier "exact, not approximate" claim was about the wrong quantity.**
+
+What is exact is the sandwich, which needs no tolerance because softplus is decreasing in
+Delta:
+
+    softplus(m - step/delta_max)  <=  L_step  <=  softplus(m - step/delta_min)
+
+and the margin arithmetic `m = margin_steps * (-log gamma)` plus the z indexing -- which are
+what the fixture actually tests. (6) L_good's sandwich runs the OTHER way, because relu is
+increasing in Delta; see §7.12.
 """
 
 from __future__ import annotations
@@ -50,7 +64,13 @@ def _empty(D_term: Tensor) -> tuple[Tensor, dict[str, float]]:
     """Masked, not crashed: no z exists (fully correct trajectory) or no g exists (question
     with no correct trajectory). Keeps a zero in the graph so backward still works."""
     zero = D_term.sum() * 0.0
-    return zero, {"step/pairs": 0.0, "step/distinct_z": 0.0, "step/loss": 0.0}
+    return zero, {
+        "step/pairs": 0.0,
+        "step/distinct_z": 0.0,
+        "step/loss": 0.0,
+        "step/delta_min": 0.0,
+        "step/delta_max": 0.0,
+    }
 
 
 def step_loss(
@@ -103,6 +123,12 @@ def step_loss(
             # count that matters -- the pairs reuse the same psi_z against several goals.
             "step/distinct_z": float(losers.numel()),                 # expect ~28
             "step/delta_mean": float(delta.mean()),
+            # softplus is decreasing in delta, so the loss is sandwiched:
+            #   softplus(m - delta_max) <= L_step <= softplus(m - delta_min)
+            # That is an exact bound with no tolerance in it, and it is what the §18 init probe
+            # checks against instead of assuming Delta ~ 0 (tests/test_gpu.py).
+            "step/delta_min": float(delta.min()),
+            "step/delta_max": float(delta.max()),
             "step/delta_at_margin_fraction": float((delta > m).float().mean()),
             "step/margin": m,
             "step/z_zero_fraction": float((batch.traj_z[losers] == 0).float().mean()),

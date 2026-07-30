@@ -173,7 +173,15 @@ def main(argv: list[str] | None = None) -> int:
         "n_train_questions": len(train_q),
         "n_val_questions": len(val_q),
         "n_sequences": len(all_rows),
-        "sequences_per_question": len(all_rows) / max(len(train_q) + len(val_q), 1),
+        # ~9.18. This is what is ON DISK -- every trajectory of every selected question, per
+        # §2 #1. It is NOT what a training epoch consumes: the sampler takes
+        # min(4, k_c) + min(3, k_i) = 4.33 per question (§8.1's caps), so one epoch is ~99.6k
+        # sequences and ~889 optimizer steps, not 211k and 1,885. The key is named for the
+        # disk on purpose -- reading 9.18 as the epoch rate is exactly the mistake that
+        # produced the 106-step run (§8.2, §11.1). train.py derives its step count from the
+        # realised `epoch_batches`, never from this number.
+        "trajectories_per_question_on_disk": len(all_rows) / max(len(train_q) + len(val_q), 1),
+        "sampler_sequences_per_question_expected": 4.33,
         "dataset_stats": stats,
         "length_stats": length_stats,
         "branch_points": branch_counters,
@@ -188,7 +196,8 @@ def main(argv: list[str] | None = None) -> int:
     (out / "val_questions.txt").write_text("\n".join(sorted(q.qid for q in val_q)))
     print(json.dumps({k: selection[k] for k in
                       ("selection_sha_train", "selection_sha_val", "n_sequences",
-                       "sequences_per_question")}, indent=2), flush=True)
+                       "trajectories_per_question_on_disk",
+                       "sampler_sequences_per_question_expected")}, indent=2), flush=True)
     return 0
 
 

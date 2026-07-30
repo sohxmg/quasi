@@ -18,7 +18,7 @@ wrong once already and is written down.
 | GPU | RTX 5070 Ti, 16 GB, **Blackwell / sm_120** |
 | Driver | **≥ 570** (Blackwell needs it) |
 | Python | **3.12** |
-| torch | a **cu128** build — required for sm_120, and cu128 wheels start at torch 2.7 |
+| torch | a **cu128-or-newer** build — sm_120 kernels first appear in cu128, and cu128 wheels start at torch 2.7. Newer toolkits are fine: **`torch 2.13.0+cu130` is what the box runs and the GPU suite passes on it (2026-07-27)** |
 | Disk | ~15 GB free: ~3.1 GB model, ~2 GB HuggingFace dataset cache, ~200 MB processed parquet, ~100 MB per checkpoint |
 | Network | HuggingFace access for `Qwen/Qwen2.5-Math-1.5B-Instruct`, `trl-lib/math_shepherd`, `Qwen/ProcessBench` (all public — no token needed) |
 | tmux | **mandatory** for every GPU run |
@@ -75,13 +75,13 @@ print('bf16 matmul ok:', bool((torch.randn(8,8,device='cuda',dtype=torch.bfloat1
 ```
 
 ```
-torch 2.8.x+cu128 cuda 12.8
+torch 2.13.0+cu130 cuda 13.0            # measured 2026-07-27; anything >= cu128 is fine
 device NVIDIA GeForce RTX 5070 Ti sm_120
 bf16 matmul ok: True
 ```
 
-If `sm_120` does not appear, or `torch.version.cuda` is not `12.8`, stop and fix that — see
-§7.1.
+If `sm_120` does not appear, or `torch.version.cuda` is **below 12.8**, stop and fix that — see
+§7.1. Compare it as a version, not a string: cu130 is newer than cu128, not different from it.
 
 **Every shell that touches the GPU:**
 
@@ -114,12 +114,12 @@ pytest tests/ -m "not gpu" -q
 ```
 
 ```
-161 passed, 1 skipped
+197 passed, 2 skipped
 ```
 
-The skip is `tests/test_gpu.py`, which is deselected by the marker. **This suite must be green
-before anything else** — it pins the index conventions, and an off-by-one there is invisible
-in every loss curve later.
+The skips are `tests/test_gpu.py` and `tests/test_good_loss_ablation.py`, both deselected by
+their markers. **This suite must be green before anything else** — it pins the index
+conventions, and an off-by-one there is invisible in every loss curve later.
 
 ### 3.2 GPU suite — the first thing that touches CUDA and the real model
 
@@ -130,12 +130,28 @@ pytest tests/test_gpu.py -m gpu -v -s
 Downloads Qwen2.5-Math-1.5B-Instruct (~3.1 GB) on first run, then takes a few minutes. `-s`
 matters: several tests **print measurements** that replace estimates in the docs —
 
-* `test_environment_is_blackwell_with_a_cu128_torch` → your device/sm/torch line
+* `test_environment_is_blackwell_with_a_cu128_or_newer_torch` → your device/sm/torch/arch line
 * `test_bf16_backbone_with_fp32_heads_and_fp32_distances` → `logit_std`, which must be `> 0`
   (`≈ 0` is bug B10a, the fp32 distance cast not taking effect)
 * `test_memory_probe_at_the_full_batch_shape` → **peak VRAM and a projected h/epoch**
 * `test_h_s0_from_a_prompt_only_forward_equals_the_full_sequence` → the number phase 2's
   whole cost model rests on
+* `test_l_good_reads_the_same_delta_the_probe_reports` → ⑥ `L_good`'s `Δ` panel beside
+  diagnostic #14's, which must agree because they are the same tensor (§7.12)
+
+**Nothing in this file trains.** Every test is forwards and single backwards on the shared
+model fixture. The two ⑥ tests that *do* take optimizer steps live in
+`tests/test_good_loss_ablation.py` behind the `ablation` marker and are **not run here**:
+
+```bash
+pytest tests/test_good_loss_ablation.py -m ablation -v -s     # OPT-IN. ~2 min, loads the
+                                                              # backbone twice, 12 steps each
+```
+
+**Do not run that before the phase-1 run.** It answers "does `L_good` flatten the good/bad
+separation", and the run itself answers that better and for free — `probe03/gap` and
+`probe14/delta_good_of_correct/frac_above_natural` are logged every `log_every` steps over
+real batches, from step 1. The ablation is for diagnosing a run that went wrong.
 
 If `test_environment_*` fails, fix that first — everything after it will fail for the wrong
 reason.
@@ -162,15 +178,33 @@ selected trajectory with the real Qwen tokenizer, mines the branch points, and w
 
 **What to check in the output:**
 
+**All values below are MEASURED from the first real run, 2026-07-27.** Three rows of this table
+used to hold pre-run estimates and all three were wrong — see the note underneath, because two of
+them looked alarming and were not.
+
 | line | expected | if it differs |
 |---|---|---|
 | `"questions": 45989` | exact | the dataset changed under us — every number in `CLAUDE.md` §4 is then suspect |
 | `"trainable_questions": 40247` | exact | same |
-| `"fraction_correct": 0.366` | ±0.001 | same |
-| `"all_labels_equals_last_label": 1.0` | exactly 1.0 | CRM's core assumption broke |
-| `REAL tokenised lengths` | p99 near 702, `over_max_len_fraction` ~0.0005 | this **replaces** §4.6's chars/3.4 estimate — record it |
-| `disagreeing_branch_points` | ~63,000 (over the selected train questions) | §8.3 |
-| `selection_sha_train` | any hex | **write it down** — it identifies the exact question set (R10) |
+| `"fraction_correct": 0.3658` | ±0.001 | same |
+| `"all_labels_equals_last_label": 0.99999` | ±0.00001, with `"last_label_disagreements": 4` | more than a handful of disagreements means the label semantics moved. **A `0.0` here means you are on an old build** where this stat was a boolean |
+| `"recovery_fraction": 0.0148` | ±0.0005 | §16.15's label noise changed |
+| `REAL tokenised lengths` | median 248, p99 866, `over_max_len_fraction` 0.0049 | a different tokenizer or `prompt_format`; §4.6 |
+| `disagreeing_branch_points` | ~24,000 over the selected 34,650 questions (30,344 on full train; the ~15,900 figure was counted at the old `n_questions: 23000`) | §4.4 / §8.3 |
+| `"trajectories_per_question_on_disk": 9.17` | ~9.18 | **this is the on-disk rate, not the epoch rate.** The sampler takes 4.33/question (§8.1's caps), so one epoch is ~150k sequences and ~1,460 steps at `n_questions: 34650`. Reading 9.18 as the epoch rate is what produced the 106-step run (§11.1) |
+| `selection_sha_train` | **changes with `n_questions`.** `e81beeb8d527…` was seed 42 / `n_questions: 23000`; the shipped config is now **34650** and the SHA moves with it — **write down whatever this run prints** (R10). If you see the old SHA, `prepare_data.py` did not re-run and the training set is still the 23,000-question one |
+
+**What the first run corrected, so nobody re-panics:** this table asked for
+`all_labels_equals_last_label: 1.0` "exactly", flagged as *"CRM's core assumption broke"*, and the
+run printed `0.0`. **Nothing broke.** The stat was a boolean `all()` over 422,407 rows and CLAUDE
+§4.2's "100.0%" was a rounded 99.999% — **4 rows** disagree, all `[T…T, F, T…T]`. Every loss
+consumes `all(labels)` (`trajectory_is_correct`), so those four are incorrect with `z` at their
+first False, exactly as §16.15 says. The other two: token lengths ran ~20% above the chars/3.4
+estimate (`over_max_len` 0.489% against a claimed 0.05%, so 1,121 sequences dropped rather than
+~200 — small, one-sided, and `max_len` stays 1024 unless the memory probe is re-run), and the
+`~63,000` disagreeing branch points was extrapolated from a 4,000-question sample and is really
+~30,000 on full train. None of the three blocks training, and none of them required re-running
+`prepare_data.py` — nothing reads `selection.json` but a human.
 
 Mismatches print with `!!` and do not abort; that is deliberate — you decide whether the
 dataset moved or the config did.
@@ -207,7 +241,8 @@ bash scripts/train.sh --max-steps 20
 
 **Read all four launch blocks before walking away.** They print in this order:
 
-1. `[launch/data]` — `optimizer_steps` (expect **~889** for the shipped config) and
+1. `[launch/data]` — `optimizer_steps` (expect **~1,460** for the shipped config; ~971 means
+   `prepare_data.py` was not re-run after `n_questions` rose to 34,650) and
    `warmup_steps` (~27), plus `questions_per_batch_mean` (~12.9),
    `distinct_z_per_batch_mean` (~28), `step_pairs_per_batch_mean` (~64) and
    `padding_fraction` (~0.10 with `group_by_length`).
@@ -219,8 +254,15 @@ bash scripts/train.sh --max-steps 20
    its peak VRAM. An OOM shows up here in 30 seconds instead of three hours in.
 4. `[launch/init_values]` — actual vs expected at step 0:
    * `nce ≈ log(R) ≈ 5.85` — pinned there with `logit_std ≈ 0` is bug B10a
-   * `step ≈ 1.6094` — this one is nearly exact; if it is far off, the margin or the `z`
-     indexing is wrong
+   * `step ≈ 2.1`, **not** 1.6094 — `ln 5 = 1.6094` needs `Δ_{z+1} = 0`, which is a fixture
+     identity, not the model at init (`ψ_0` is the prompt-only state and starts away from
+     mid-solution states, so `Δ` starts negative). **Measured 2.0796 at `step_delta_mean`
+     −0.44.** The level moves with the batch's z mix, so check the RELATION, not the number:
+     `step == log(1 + exp(m − Δ))` with `m = 1.386`. See CLAUDE.md §7.6.7
+   * `backup` prints `nan` whenever `linear_branch_fraction` is between 0.05 and 0.95 — delta is
+     bimodal at init and no mean-based prediction is valid there. Read
+     `linear_branch_fraction` falling 1.0 → ~0 over ~100 steps instead (measured: 0.52 at step
+     0, 0.003 by step 20)
    * `backup ≈ γ − mean(Dist)` — see the note in `IMPLEMENTATION.md` §6; the sign at step 1
      is not diagnostic, the *trend* is
    * `cf = 0.0` — deferred by decision
@@ -249,7 +291,7 @@ You can run this on the 20-step probe checkpoint; that is the point of it being 
 
 ```bash
 tmux new -s feynman
-bash scripts/train.sh                 # ~889 optimizer steps, estimated 2–4 h
+bash scripts/train.sh                 # ~1,460 optimizer steps, estimated 3–6 h
 ```
 
 Detach with `Ctrl-b d`, reattach with `tmux attach -t feynman`.
@@ -258,7 +300,9 @@ Detach with `Ctrl-b d`, reattach with `tmux attach -t feynman`.
 
 | | |
 |---|---|
-| `probe14/delta_good_of_correct/positive_fraction` | **the single best predictor of ProcessBench F1.** `L_step` never sees a correct trajectory, so a positive Δ tail here is F1 leaking with no loss training against it |
+| `probe14/delta_good_of_correct/frac_above_natural` | **the single best predictor of ProcessBench F1, and read THIS rather than the mean.** `L_step` never sees a correct trajectory, so a positive Δ tail here is F1 leaking. On the first full run the mean was `+0.240` — which looks like a small offset — while this read **0.34**, τ fitted to 2.39 and F1 capped at 0.456 (§7.12). `p90`/`p99` are logged beside it |
+| `invariance/residual_diagonal` | **the `λ_good` guard.** ⑥ pays for its Δ reduction out of ② (measured 0.098 → 0.260 at λ=1, §7.12). Under **0.15 by step ~200** and not rising after; otherwise halve `losses.lambda_good` to 0.5. Visible from step 1, so a wrong λ costs ~100 steps to catch instead of the whole run |
+| `good/above_target_fraction`, `good/delta_mean`, `good/lambda_effective` | ⑥ `L_good`'s own view, logged even at `λ_good = 0`. `good/margin` must print **negative**; `lambda_effective` ramps 0 → 1 over the first 100 steps (`good_loss.warmup_steps`) |
 | `probe02/delta_good_mean` vs `−0.693` | the ruler. The old project's was 108× off and nobody noticed |
 | `probe03/gap` | good-vs-bad Δ separation. Collapsing → φ is ignoring its action |
 | `nce/logit_std` | `≈ 0` with the loss stuck at `log(R)` → bug B10a |
@@ -321,9 +365,15 @@ Three rules that are not negotiable:
 1. **Never set `m` or `t` by hand.** They are derived from `discount`
    (`m = margin_steps·(−log γ)`, `t = clip_t_steps·(−log γ)`), and the only sanctioned
    `discount` values are **0.5** (shipped) and **0.7** (documented fallback).
-2. **If it OOMs, lower `sampling.sequences_per_micro_batch` AND raise `train.grad_accum`
-   together.** Raising `grad_accum` alone cuts the optimizer-step count — that is exactly the
-   regression that produced a 106-step run.
+2. **If it OOMs, lower `sampling.max_padded_tokens` FIRST — not the sequence budget.**
+   A batch costs `len(batch) x max_len`, so the token cap binds only on the ~17% of batches
+   that are actually too big and leaves the rest (and their `L_NCE` negative pool) alone.
+   Cutting `sequences_per_micro_batch` shrinks *every* batch and halves the pool and `Q`
+   with it — measured in CLAUDE.md §8.1.2. `grad_accum` does not need to move for the cap.
+   If you do cut the sequence budget, lower it **and raise `train.grad_accum` together**:
+   raising `grad_accum` alone cuts the optimizer-step count, which is exactly the regression
+   that produced a 106-step run. Re-run `python scripts/batch_report.py` either way — it
+   prints the exact pool and `Q` you would be trading.
 3. **If GPU time is short, cut `data.n_questions`, not `grad_accum`.** Coverage falls
    linearly; step count does not.
 
@@ -346,7 +396,7 @@ memory probe, the init values and the gate results go through `logger.event()`, 
 
 | symptom | cause | fix |
 |---|---|---|
-| `CUDA error: no kernel image is available for execution` | torch built without sm_120 (a cu121/CPU wheel, or torch < 2.7) | reinstall from the cu128 index; `torch.version.cuda` must read `12.8` |
+| `CUDA error: no kernel image is available for execution` | torch built without sm_120 (a cu121/CPU wheel, or torch < 2.7) | reinstall from the cu128 index (or any newer one); `torch.version.cuda` must be **≥ 12.8**, and `torch.cuda.get_arch_list()` should mention `120` |
 | `pip install flash-attn` fails | there is **no** cp312/cu128/sm_120 wheel and a source build needs `nvcc` | don't. `sdpa` is already a fused flash-family kernel and attention is only ~2% of FLOPs at our lengths |
 | `CUBLAS_STATUS_NOT_SUPPORTED` inside SDPA `o_proj` on the **first** forward | Blackwell + bf16 path | cast the model to fp32 after load, before `.cuda()`. **Do not** try `torch.backends.cuda.preferred_blas_library("cublaslt")` — it gets past `o_proj` and then throws `invalid resource handle` at a layernorm |
 | `ImportError: No module named feynman_prm` | `pip install -e .` not run | run it (the `scripts/*.py` also self-bootstrap `sys.path`) |
@@ -401,9 +451,19 @@ python scripts/export_merged.py --checkpoint runs/phase1/final --out /tmp/merged
 It copies `heads.pt` alongside — **a merged backbone without the heads is a useless artifact**,
 which is the exact failure the old project shipped once.
 
-**Ground truth about what has and has not been run:** the CPU suite is green, and the phase-1
-inner loop has been dry-run against a stub backbone. `tests/test_gpu.py`, `prepare_data.py`,
-and every path that touches `transformers`/`peft`/`datasets` **have never executed** — the
-machine this was written on has no GPU and none of those packages. Treat §3.2's printed
-numbers as the first real measurements, and tell the author if any of them contradict the
-estimates in `IMPLEMENTATION.md`.
+**Ground truth about what has and has not been run** (updated 2026-07-27):
+
+* **CPU suite** — green, 164 tests.
+* **`tests/test_gpu.py`** — has now run on the box, 26/26 green on `torch 2.13.0+cu130`. Its four
+  initial failures were **wrong assertions, not wrong code**: a `startswith("12.8")` cu-version
+  check, two absolute bf16 tolerances on hidden states (0.05 where one bf16 rounding at Qwen's
+  massive activations is already 0.75), and `L_step = ln 5` at init, which is a `Δ = 0` fixture
+  identity rather than the model's value (§7.6.7).
+* **`prepare_data.py`** — has now run. Every §4 count reproduced exactly; three lines in §4
+  turned out to be estimates rather than counts and are corrected in place (see §4's table
+  above).
+* **Not yet run:** phase-1 training past the smoke probe, the §10.1 gate on trained
+  representations, phase 2, and ProcessBench eval.
+
+When a printed number contradicts a doc, **count it on the full split before assuming the data
+moved** — that is how all three of the above resolved.

@@ -37,7 +37,10 @@ class StubBackbone(nn.Module):
     def get_input_embeddings(self) -> nn.Module:
         return self.emb
 
-    def forward(self, inputs_embeds=None, attention_mask=None):
+    def forward(self, inputs_embeds=None, attention_mask=None, use_cache=None):
+        # Qwen2Model takes `use_cache`; the wrapper passes it explicitly (wrapper.py:76) so the
+        # stub must accept it or it only ever tests a signature the real backbone does not have.
+        assert use_cache is False, "the wrapper must disable the KV cache: we never generate"
         return SimpleNamespace(last_hidden_state=self.proj(inputs_embeds))
 
 

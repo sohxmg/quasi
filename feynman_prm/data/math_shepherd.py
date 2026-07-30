@@ -136,7 +136,17 @@ def dataset_stats(questions: Sequence[Question]) -> dict[str, float]:
     ge1_correct = sum(q.n_correct >= 1 for q in questions)
     ge2_correct = sum(q.n_correct >= 2 for q in questions)
     pairs = sum(q.n_correct * q.n_incorrect for q in questions)
-    last_label_is_correctness = all(
+    # §4.2 quotes this as a FRACTION ("100.0%"), so report a fraction. It used to be
+    # `all(...)`, which is a boolean over 422,407 rows and therefore reads 0.0 the moment a
+    # single row disagrees -- which four of them do, so the real prepare_data run printed
+    # `all_labels_equals_last_label: 0.0` and looked like the dataset had changed under us.
+    # **Measured 2026-07-27: 4 rows of 422,407 (0.0009%)**, all of the shape
+    # `[T ... T, F, T ... T]` -- a recovery whose last label is True. 6,263 rows (1.48%) have a
+    # recovery at all; almost all of them fall back to False before the end, which is why the
+    # two §4.2 facts looked contradictory but are not. We compute `all(labels)` everywhere
+    # (`trajectory_is_correct`) and never rely on the last label, so those four rows are simply
+    # treated as incorrect with z at their first False, per §16.15.
+    n_last_label_matches = sum(
         t.correct == t.labels[-1] for q in questions for t in q.trajectories
     )
     return {
@@ -157,7 +167,8 @@ def dataset_stats(questions: Sequence[Question]) -> dict[str, float]:
         "trainable_fraction": len(trainable) / max(len(questions), 1),
         "within_question_pairs": pairs,
         "correct_per_question_mean": n_correct / max(len(questions), 1),
-        "all_labels_equals_last_label": float(last_label_is_correctness),
+        "all_labels_equals_last_label": n_last_label_matches / max(n_traj, 1),
+        "last_label_disagreements": n_traj - n_last_label_matches,     # 4 on full train
     }
 
 

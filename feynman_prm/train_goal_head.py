@@ -19,6 +19,8 @@ learn that in minutes rather than after a full cycle.
 from __future__ import annotations
 
 import argparse
+import math
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -29,8 +31,8 @@ from .config import Config
 from .data.collate import collate
 from .data.math_shepherd import read_sequences_parquet
 from .data.tokenize import sep_token_id
-from .diagnostics.logging import RunLogger
-from .losses.goal import goal_loss, terminal_spread_ratio
+from .diagnostics.logging import Progress, RunLogger
+from .losses.goal import goal_loss, terminal_separability, terminal_spread_ratio
 from .model.backbone import assert_phase2_trainable, load_backbone_with_adapter, load_tokenizer
 from .model.wrapper import FeynmanPRM
 from .utils.checkpoint import load_config_from_checkpoint, load_heads, save_checkpoint
@@ -49,6 +51,15 @@ def build_cache(model, tokenizer, rows, cfg: Config, device, batch_sequences: in
             by_question[row.qid].append(row)
     qids = sorted(by_question)
     qindex = {q: i for i, q in enumerate(qids)}
+    cap = cfg.goal_head.max_terminals_per_question
+    n_terminals = sum(min(cap, len(by_question[q])) for q in qids)
+    print(
+        f"[cache] {len(rows):,} train sequences -> {len(qids):,} questions with a correct "
+        f"solution, {n_terminals:,} terminals to encode (cap {cap}/question).\n"
+        f"[cache] Both passes are backbone forwards and this is the slow part of phase 2 "
+        f"-- expect tens of minutes, not seconds.",
+        flush=True,
+    )
 
     # ---- h_{s_0}: one prompt-only forward per question --------------------------------
     # The prompt text is not stored in sequences.parquet, so s_0's ids are recovered from
@@ -75,8 +86,10 @@ def build_cache(model, tokenizer, rows, cfg: Config, device, batch_sequences: in
         )
         for b, (qi, _, _) in enumerate(pending):
             h_s0[qi] = h[b].float().cpu()
+        prompt_progress.advance(len(pending))
         pending.clear()
 
+    prompt_progress = Progress("cache/h_s0", len(qids))
     for qid in qids:
         row = by_question[qid][0]
         s0 = int(row.state_pos[0])
@@ -97,9 +110,10 @@ def build_cache(model, tokenizer, rows, cfg: Config, device, batch_sequences: in
         for b, (qi, _) in enumerate(pending_rows):
             terminals.append(reps.psi[int(batch.traj_terminal[b])].float().cpu())
             terminal_question.append(qi)
+        terminal_progress.advance(len(pending_rows))
         pending_rows.clear()
 
-    cap = cfg.goal_head.max_terminals_per_question
+    terminal_progress = Progress("cache/psi_terminals", n_terminals)
     for qid in qids:
         for row in by_question[qid][:cap]:
             pending_rows.append((qindex[qid], row))
@@ -115,6 +129,51 @@ def build_cache(model, tokenizer, rows, cfg: Config, device, batch_sequences: in
     )
 
 
+GATE_MAX_QUESTIONS = 200
+GATE_MAX_TERMINALS_PER_QUESTION = 4
+
+
+def gate_subsample(
+    terminals: torch.Tensor,
+    terminal_question: torch.Tensor,
+    max_questions: int = GATE_MAX_QUESTIONS,
+    per_question: int = GATE_MAX_TERMINALS_PER_QUESTION,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The §10.1 gate is an ESTIMATE and must be run on a subsample, not the whole cache.
+
+    `terminal_spread_ratio` and `terminal_separability` both materialise the FULL pairwise
+    matrix -- `psi[:, None, :]` against `psi[None, :, :]`, so `O(N^2 * D)`. That is fine at
+    `scripts/goal_gate.py`'s default 200 questions (~525 terminals, ~0.5 GiB) and impossible
+    on the phase-2 cache, which holds every correct terminal of every selected question:
+
+        N ~ 95,000  ->  N^2 * (D/2) * 4 B  =  **8,621 GiB**, the observed OOM
+
+    §10.1 sizes the estimate itself -- "3.36 correct solutions per question on average, which
+    is enough" -- so this is the shape the gate was designed for, not a degraded version of it.
+
+    Deterministic (first `max_questions` in cache order, first `per_question` terminals of
+    each), and restricted to questions with >= 2 terminals since a singleton contributes no
+    within-question pair.
+    """
+    from collections import Counter
+
+    labels = terminal_question.tolist()
+    counts = Counter(labels)
+    eligible: set[int] = set()
+    for q in labels:
+        if counts[q] >= 2 and q not in eligible and len(eligible) < max_questions:
+            eligible.add(q)
+
+    taken: dict[int, int] = defaultdict(int)
+    chosen = []
+    for i, q in enumerate(labels):
+        if q in eligible and taken[q] < per_question:
+            taken[q] += 1
+            chosen.append(i)
+    idx = torch.as_tensor(chosen, dtype=torch.long)
+    return terminals[idx], terminal_question[idx]
+
+
 def fit_goal_head(model, cache, cfg: Config, device, logger: RunLogger) -> None:
     h_s0, terminals, terminal_question, _ = cache
     h_s0 = h_s0.to(device)
@@ -123,8 +182,40 @@ def fit_goal_head(model, cache, cfg: Config, device, logger: RunLogger) -> None:
 
     optimizer = torch.optim.AdamW(model.goal_head.parameters(), lr=cfg.goal_head.lr, foreach=False)
     n = terminals.shape[0]
+    if n == 0:
+        # The empty cache used to reach the log line below with `info` never assigned and die
+        # on an UnboundLocalError 20 frames from the cause. Say what is actually wrong.
+        raise RuntimeError(
+            "no cached terminals: sequences.parquet's train split has no correct trajectories. "
+            "Re-run scripts/prepare_data.py (§8.2 -- the selection SHA moves with n_questions)."
+        )
+
+    batches_per_epoch = math.ceil(n / cfg.goal_head.batch_size)
+    # §11.1's discipline, which phase 1 asserts and phase 2 never did: a schedule is
+    # meaningless without a step count, and this one is `ceil(n / batch_size) * epochs` --
+    # small enough to be worth printing before it runs rather than inferring from wall clock.
+    logger.event(
+        "phase2/schedule",
+        {
+            "questions": int(h_s0.shape[0]),
+            "terminals": n,
+            "batch_size": cfg.goal_head.batch_size,
+            "batches_per_epoch": batches_per_epoch,
+            "epochs": cfg.goal_head.epochs,
+            "optimizer_steps": batches_per_epoch * cfg.goal_head.epochs,
+            "lr": cfg.goal_head.lr,
+        },
+    )
+
+    step = 0
     for epoch in range(cfg.goal_head.epochs):
         perm = torch.randperm(n, device=device)
+        # Epoch MEANS, weighted by terminals per batch. The last minibatch's `info` was what
+        # this used to log, and a single 512-terminal draw is far too noisy to read a trend
+        # off -- which mattered because 20 epochs is the entire curve.
+        totals: dict[str, float] = defaultdict(float)
+        seen = 0
+        t0 = time.time()
         for start in range(0, n, cfg.goal_head.batch_size):
             idx = perm[start : start + cfg.goal_head.batch_size]
             pred = model.goal_head(h_s0)                     # (Q, D)
@@ -134,7 +225,22 @@ def fit_goal_head(model, cache, cfg: Config, device, logger: RunLogger) -> None:
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-        logger.log(epoch, {"goal/epoch": epoch, **info}, console=True)
+            step += 1
+            for key, value in info.items():
+                totals[key] += value * len(idx)
+            seen += len(idx)
+        logger.log(
+            epoch,
+            {
+                "goal/epoch": epoch,
+                "goal/optimizer_step": step,
+                "goal/batches": batches_per_epoch,
+                "goal/terminals_seen": seen,
+                "goal/seconds": time.time() - t0,
+                **{key: total / seen for key, total in totals.items()},
+            },
+            console=True,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -155,33 +261,67 @@ def main(argv: list[str] | None = None) -> int:
     from .model.backbone import read_hidden_size
 
     model = FeynmanPRM(cfg, read_hidden_size(cfg.model.name), backbone=backbone, with_goal_head=True)
-    load_heads(model, ckpt)
+    # A phase-1 checkpoint carries psi and phi and NOTHING ELSE -- the goal head does not exist
+    # until here (§7.7, locked #15), so its absence is the expected state and not the §14 trap
+    # the guard is for. Named explicitly so a phase-2 checkpoint that lost a TRAINED goal head
+    # still fails loudly everywhere else.
+    loaded = load_heads(model, ckpt, allow_missing=("goal_head.",))
+    # COUNTS, never the lists. `missing` is every backbone parameter -- heads.pt holds only
+    # HEAD_PREFIXES by design, so load_state_dict reports the whole 1.5B backbone as missing
+    # and `**loaded` put ~340 layer names on the console.
+    logger.event(
+        "phase2/heads_loaded",
+        {
+            "phase1_step": loaded["step"],
+            "freshly_initialised": loaded["freshly_initialised"],
+            "n_missing_non_head": len(loaded["missing"]),
+            "n_unexpected": len(loaded["unexpected"]),
+        },
+    )
     model.to(device)
     model.freeze_for_phase2()
     logger.event("phase2/trainable", assert_phase2_trainable(model))
 
-    rows = read_sequences_parquet(Path(cfg.data.dir) / "sequences.parquet", split="train")
+    # ~300k rows rebuilt into SequenceRow objects one at a time: a minute of silence on its
+    # own, before the backbone has done anything.
+    parquet = Path(cfg.data.dir) / "sequences.parquet"
+    print(f"[cache] reading {parquet} (train split)...", flush=True)
+    t_read = time.time()
+    rows = read_sequences_parquet(parquet, split="train")
+    print(f"[cache] read {len(rows):,} rows in {time.time() - t_read:.1f}s", flush=True)
+
     cache = build_cache(model, tokenizer, rows, cfg, device)
     torch.save(
         {"h_s0": cache[0], "terminals": cache[1], "terminal_question": cache[2], "qids": cache[3]},
         out_dir / "cache.pt",
     )
+    print(f"[cache] wrote {out_dir / 'cache.pt'}", flush=True)
 
-    gate = terminal_spread_ratio(cache[1].to(device), cache[2].to(device), model.distance)
+    psi_t, qidx = gate_subsample(cache[1], cache[2])
+    gate = terminal_spread_ratio(psi_t.to(device), qidx.to(device), model.distance)
+    gate.update(terminal_separability(psi_t.to(device), qidx.to(device), model.distance))
+    gate["gate/terminals"] = len(psi_t)
     logger.event("phase2/gate_before_fit", gate)
-    if gate["gate/ratio"] > 0.3:
-        print(
-            f"[gate] within/across = {gate['gate/ratio']:.3f} > 0.3 (§10.1). Correct endings "
-            "do not cluster tightly by question; the goal head's target is weak. Proceeding, "
-            "but read §10.1 before spending more GPU hours -- the fallback is the goal-free "
-            "asymmetry score (§9.4), NOT a reference goal (§5.1).",
-            flush=True,
-        )
+    # READ `auc`, NOT `ratio` (§10.1.1). The "< 0.3" rule was never derived -- it is the one
+    # number in CLAUDE.md with no §17 provenance entry -- and at D=512 a ratio of 0.62 is
+    # already 100% same-question retrieval. Report against the measured untrained baseline
+    # (auc 0.904, recall@1 0.618) rather than a constant, because a ratio is a comparison.
+    print(
+        f"[gate] auc = {gate['gate/auc']:.3f}  recall@1 = {gate['gate/recall_at_1']:.3f}  "
+        f"ratio = {gate['gate/ratio']:.3f}   on {len(psi_t)} terminals / "
+        f"{len(torch.unique(qidx))} questions."
+        "\n[gate] The untrained baseline measured auc 0.904 / recall@1 0.618 (§10.1.1) -- "
+        "same-question terminals are similar before ANY training, because the solutions share "
+        "the question text. Compare against `scripts/goal_gate.py --untrained`, not against a "
+        "fixed threshold.",
+        flush=True,
+    )
 
     fit_goal_head(model, cache, cfg, device, logger)
-    logger.event("phase2/gate_after_fit", terminal_spread_ratio(
-        cache[1].to(device), cache[2].to(device), model.distance
-    ))
+    # There is deliberately no `gate_after_fit`. The gate reads only `psi(s_T)` and the
+    # distance, both FROZEN in phase 2 (locked #15), and the cache is a fixed tensor -- so it
+    # is provably the same number as `gate_before_fit`, at another O(N^2) to find that out.
+    # Phase 2 moves `goal_head`, and what moved is `goal/loss` and `goal/pred_variance`.
     save_checkpoint(out_dir / "final", model, cfg, tokenizer, step=cfg.goal_head.epochs)
     logger.close()
     return 0

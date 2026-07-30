@@ -13,6 +13,45 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 
+class Progress:
+    """A rate + ETA line for long silent stretches, printed on a TIME budget not a count.
+
+    Phase 2's `build_cache` pushes ~34M tokens through the backbone -- 11 to 38 minutes --
+    and printed nothing at all while it did, which is indistinguishable from a hang and was
+    read as one. Anything between two log lines that can outlast a coffee needs one of these.
+
+    Ticking on elapsed time rather than every N items means the line stays readable whether
+    the loop does 3 items a second or 3,000, with no per-loop tuning.
+    """
+
+    def __init__(self, label: str, total: int, every_seconds: float = 15.0):
+        self.label, self.total, self.every = label, max(total, 0), every_seconds
+        self.done = 0
+        self.t0 = self.last = time.time()
+        print(f"[{label}] starting, {self.total:,} to go", flush=True)
+
+    def advance(self, n: int = 1) -> None:
+        self.done += n
+        now = time.time()
+        # Always print the final line, however recently the last one went out.
+        if now - self.last < self.every and self.done < self.total:
+            return
+        self.last = now
+        elapsed = now - self.t0
+        rate = self.done / elapsed if elapsed > 0 else 0.0
+        pct = 100.0 * self.done / self.total if self.total else 100.0
+        # A caller whose `total` is slightly off should get a pinned bar, not "101.1%" and a
+        # negative ETA -- the display must never be the thing that looks broken.
+        remaining = max(self.total - self.done, 0)
+        eta = remaining / rate if rate > 0 else float("nan")
+        pct = min(pct, 100.0)
+        print(
+            f"[{self.label}] {self.done:,}/{self.total:,} ({pct:5.1f}%)  "
+            f"{rate:8.1f}/s  elapsed {elapsed / 60:6.1f}m  eta {eta / 60:6.1f}m",
+            flush=True,
+        )
+
+
 class RunLogger:
     def __init__(
         self,
@@ -73,11 +112,30 @@ class RunLogger:
             ("invariance/loss", "inv"),
             ("backup/loss", "bkp"),
             ("step/loss", "step"),
+            ("good/loss", "good"),
             ("probe03/gap", "gap"),
+            # The console line is what gets watched in tmux for hours, so the two numbers
+            # §7.12 exists to move sit on it: the good-step tail, and the gap it must not
+            # cost. `above` is the fraction of good steps over target -- read it, not the
+            # mean, which stayed at +0.240 through a whole run that capped F1 at 0.456.
+            ("good/above_target_fraction", "above"),
             ("probe01/questions_in_batch", "Q"),
             ("step/distinct_z", "z"),
+            # ---- phase 2 (§7.7). It logs per EPOCH, and 20 epochs is the whole curve, so
+            # `var` earns its place on the line: diagnostic #6 fires when the head gives up on
+            # conditioning and learns one global anchor, and near-zero variance is how that
+            # looks while `goal/loss` falls perfectly smoothly.
+            ("goal/loss", "goal"),
+            ("goal/pred_variance", "var"),
+            ("goal/seconds", "s"),
         ]
         parts = [f"step {step:>6}"]
+        if "goal/epoch" in metrics:
+            # Phase 2's x-axis is the epoch, so labelling it "step" would misread by
+            # `batches_per_epoch`. Both numbers go on the line.
+            parts = [f"epoch {int(metrics['goal/epoch']):>4}"]
+            if "goal/optimizer_step" in metrics:
+                parts.append(f"step={int(metrics['goal/optimizer_step'])}")
         for key, label in keys:
             if key in metrics:
                 parts.append(f"{label}={metrics[key]:+.4f}")

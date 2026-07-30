@@ -79,3 +79,90 @@ def terminal_spread_ratio(
         "gate/across_question_terminal_spread": across,
         "gate/ratio": within / across if across else float("nan"),
     }
+
+
+def terminal_separability(
+    psi_terminals: Tensor, question_index: Tensor, distance: Distance
+) -> dict[str, float]:
+    """The §10.1 gate's question, asked as a SEPARABILITY question rather than a ratio.
+
+    `terminal_spread_ratio` compares two MEANS, and in 512 dimensions that is a weak proxy
+    for what the goal head actually needs. Concentration of measure makes both distance
+    distributions extremely tight around their means, so a modest gap between the means is
+    already total separation. Simulated on isotropic Gaussian clusters at this file's own
+    shape (200 questions x ~2.7 terminals, D=512, full_mrn):
+
+        cluster noise   ratio   AUC    recall@1
+             0.4        0.370   1.000    1.00
+             0.6        0.514   1.000    1.00
+             0.8        0.625   1.000    1.00
+             1.0        0.708   1.000    1.00
+             1.3        0.794   1.000    1.00
+
+    i.e. **ratio 0.62 is already perfect same-question retrieval.** §10.1's "< 0.3" was never
+    derived from anything -- it is the one number in CLAUDE.md with no entry in §17 -- and it
+    sits far inside the regime where the head has a perfectly well-defined target. The null
+    is what the ratio pins down well: iid terminals with no question structure give **1.000**
+    to three decimals, so the ratio's job is detecting "no signal at all", not gating.
+
+    What the goal head needs is that a question's terminals be closer to EACH OTHER than to
+    other questions' terminals, which is a ranking property:
+
+        auc      = P( d(same-question pair) < d(different-question pair) )
+        recall@1 = fraction of terminals whose nearest OTHER terminal shares its question
+
+    Read `auc`. Chance is 0.5 and it is scale-free, so unlike the ratio it needs no null run
+    to interpret. `recall@1` is the harsher version -- it is what a nearest-terminal lookup
+    would score -- and it degrades first when a minority of questions are well clustered and
+    the rest are at chance, which is the failure mode a mean ratio cannot see at all.
+
+    **The table above is isotropic Gaussian clusters and the real geometry is not that.**
+    Measured on the first phase-1 checkpoint: `ratio 0.599` came with `auc 0.875` and
+    `recall@1 0.625`, where the simulation predicted 1.000/1.00. Clean clusters cannot produce
+    that combination -- at `auc 0.875` with 531 competing across-pairs per terminal, an
+    independent-distance model puts `recall@1` near zero, so getting 0.625 means the misses
+    are structured rather than spread. Hence `questions_fully_clustered` /
+    `questions_fully_scattered`: they separate "every question is moderately noisy" (a level
+    problem -- the head still has a target everywhere, and eval's `Delta` differencing in §9.1
+    absorbs a constant goal error) from "a subset of questions has no target at all" (a
+    coverage problem -- the head works on that subset and eval degrades per question). The two
+    call for opposite responses and the mean cannot distinguish them.
+    """
+    with torch.no_grad():
+        n = len(psi_terminals)
+        d = distance(psi_terminals[:, None, :], psi_terminals[None, :, :])
+        same = question_index[:, None] == question_index[None, :]
+        eye = torch.eye(n, dtype=torch.bool, device=d.device)
+        w = d[same & ~eye].flatten().float()
+        a = d[~same].flatten().float()
+        if not len(w) or not len(a):
+            return {"gate/auc": float("nan"), "gate/recall_at_1": float("nan")}
+
+        # Exact AUC by rank, not by sampling: for each within-pair, how many across-pairs
+        # exceed it. |a| is ~285k here, so the O(|w| log|a|) form is the affordable one.
+        a_sorted = a.sort().values
+        greater = len(a_sorted) - torch.searchsorted(a_sorted, w, right=True)
+        auc = float(greater.float().mean() / len(a_sorted))
+
+        masked = d.masked_fill(eye, float("inf"))
+        nearest = masked.argmin(dim=1)
+        hit = (question_index[nearest] == question_index).float()
+        recall = float(hit.mean())
+
+        # Is the miss rate spread evenly over questions, or concentrated in a subset?
+        # A mean cannot tell those apart and they call for opposite responses.
+        qs = torch.unique(question_index)
+        per_q = torch.stack([hit[question_index == q].mean() for q in qs])
+        clustered = float((per_q == 1.0).float().mean())
+        scattered = float((per_q == 0.0).float().mean())
+
+    return {
+        "gate/auc": auc,
+        "gate/recall_at_1": recall,
+        # Diagnostic #5b: the shape of the miss rate, not its level.
+        "gate/questions_fully_clustered": clustered,
+        "gate/questions_fully_scattered": scattered,
+        "gate/per_question_recall_std": float(per_q.std()) if len(per_q) > 1 else 0.0,
+        "gate/within_pairs": len(w),
+        "gate/across_pairs": len(a),
+    }

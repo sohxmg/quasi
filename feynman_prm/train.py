@@ -37,7 +37,7 @@ from .data.sampler import (
     steps_report,
 )
 from .diagnostics.logging import RunLogger
-from .diagnostics.probes import batch_probes
+from .diagnostics.probes import asymmetry_score, batch_probes
 from .losses.matrix import build_matrices
 from .losses.total import expected_init_values, phase1_loss
 from .model.backbone import (
@@ -49,7 +49,7 @@ from .model.backbone import (
 )
 from .model.wrapper import FeynmanPRM
 from .utils.checkpoint import save_checkpoint
-from .utils.seeding import epoch_rng, goal_rng, seed_everything
+from .utils.seeding import epoch_rng, goal_rng, probe_rng, seed_everything
 
 MIN_OPTIMIZER_STEPS = 300  # §11.1: below this the schedule is meaningless. Cut n_questions,
                            # NEVER raise grad_accum alone -- that is the knob that hid the
@@ -72,7 +72,7 @@ def build_scheduler(optimizer, total_steps: int, cfg: Config):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def run_micro_batch(model, rows, batch_rows, cfg: Config, device, rng):
+def run_micro_batch(model, rows, batch_rows, cfg: Config, device, rng, step: int = 0):
     """One micro-batch: collate -> goals -> forward -> matrices -> loss."""
     # Goals are drawn on the CPU batch (the sampler is numpy, and there are no DataLoader
     # workers to seed), then both move to the device together.
@@ -89,6 +89,7 @@ def run_micro_batch(model, rows, batch_rows, cfg: Config, device, rng):
         model.distance,
         cfg,
         goal_traj=goals.goal_traj,
+        step=step,          # (6) L_good's warmup ramp only (§7.12)
     )
     return batch, goals, reps, matrices, out
 
@@ -118,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
     rng = epoch_rng(cfg.run.seed, 0)
     batches = epoch_batches(rows, slots, cfg, 0, rng)
     stats = batch_stats(batches, rows)
-    report = steps_report(stats["sequences_total"], cfg)
+    report = steps_report(stats["sequences_total"], cfg, n_batches=len(batches))
     steps_total = planned_optimizer_steps(len(batches), cfg.train.grad_accum) * cfg.train.epochs
 
     logger.event(
@@ -146,6 +147,7 @@ def main(argv: list[str] | None = None) -> int:
     model = FeynmanPRM(cfg, hidden_size, backbone=backbone, with_goal_head=False)
     model.pad_id = tokenizer.pad_token_id
     model.to(device)
+    model.train()   # must precede the memory probe: eval mode disables gradient checkpointing
 
     trainable = assert_phase1_trainable(model, cfg)   # §14: exactly {LoRA, psi, phi}
     logger.event(
@@ -166,14 +168,18 @@ def main(argv: list[str] | None = None) -> int:
         foreach=False,        # bug B9: the foreach path allocates a large fp32 transient
     )                         # torch AdamW, never FusedAdam (bug B8)
     scheduler = build_scheduler(optimizer, max(steps_total, 1), cfg)
+    # LambdaLR's constructor already applies lr_lambda(0), which is 0.0 under warmup -- so this
+    # is NOT the base LR. The B6 guard tracks the range over the whole run instead of comparing
+    # this against the final value; see the block after the loop.
     lr_before = optimizer.param_groups[0]["lr"]
+    lr_min_seen = lr_max_seen = lr_before
 
     # ---- the longest-batch memory probe (PLAN 4a) ------------------------------------
     probe_idx = longest_batch_index(batches, rows)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
     _, _, _, _, probe_out = run_micro_batch(
-        model, rows, batches[probe_idx], cfg, device, goal_rng(cfg.run.seed, 0, -1)
+        model, rows, batches[probe_idx], cfg, device, probe_rng(cfg.run.seed)
     )
     probe_out.total.backward()
     optimizer.zero_grad(set_to_none=True)
@@ -199,7 +205,8 @@ def main(argv: list[str] | None = None) -> int:
             batches = epoch_batches(rows, slots, cfg, epoch, epoch_rng(cfg.run.seed, epoch))
         for micro, batch_rows in enumerate(batches):
             batch, goals, reps, matrices, out = run_micro_batch(
-                model, rows, batch_rows, cfg, device, goal_rng(cfg.run.seed, epoch, micro)
+                model, rows, batch_rows, cfg, device, goal_rng(cfg.run.seed, epoch, micro),
+                step=step,
             )
             if not torch.isfinite(out.total):
                 raise RuntimeError(f"non-finite loss at epoch {epoch} micro {micro}: {out.info}")
@@ -207,7 +214,12 @@ def main(argv: list[str] | None = None) -> int:
 
             if not checked_init:
                 expected = expected_init_values(
-                    cfg, matrices.n_rows, out.info["backup/dist_mean"]
+                    cfg,
+                    matrices.n_rows,
+                    out.info["backup/dist_mean"],
+                    out.info["backup/delta_mean"],
+                    out.info["step/delta_mean"],
+                    out.info["backup/linear_branch_fraction"],
                 )
                 logger.event(
                     "launch/init_values",
@@ -215,28 +227,85 @@ def main(argv: list[str] | None = None) -> int:
                         "expected": {k: round(v, 4) for k, v in expected.items()},
                         "actual": {k: round(float(v), 4) for k, v in out.terms.items()},
                         "note": (
-                            "L_NCE ~ log(R); L_step is EXACT (ln 5 = 1.6094 at discount 0.5); "
-                            "L_T starts positive ~= gamma and must go negative. L_NCE pinned "
-                            "at log(R) with logit_std ~= 0 is bug B10a."
+                            "L_NCE ~ log(R); L_step is softplus(m - Delta) at the MEASURED "
+                            "Delta, not ln 5 -- Delta_{z+1} starts negative because psi_0 (the "
+                            "prompt-only state) is atypical, so ~4 at init is expected and 1.61 "
+                            "is the Delta = 0 fixture value only (§7.6); L_T at init is the "
+                            "psi/phi representation gap delta ~ 10 riding the LINEX LINEAR "
+                            "branch, so linear_branch_fraction ~ 1.0 and L_I ~ dist_mean ~ 11 "
+                            "are both correct here (§7.4.3). L_NCE pinned at log(R) with "
+                            "logit_std ~= 0 is bug B10a. L_good has NO predicted level (nan on "
+                            "purpose) -- check the sandwich relu(good/delta_min - c) <= L_good "
+                            "<= relu(good/delta_max - c), which runs OPPOSITE to L_step's, and "
+                            "note a lower bound of exactly 0 is legitimate (§7.12)."
+                        ),
+                        "step_delta_mean": round(out.info["step/delta_mean"], 4),
+                        # §7.12: c must be NEGATIVE. It is derived, but it is printed at
+                        # launch because the sign is the one thing about this term that no
+                        # downstream curve would reveal if it were wrong.
+                        "good_margin": round(cfg.good_margin, 4),
+                        "lambda_good": cfg.losses.lambda_good,
+                        "good_delta_mean": round(out.info["good/delta_mean"], 4),
+                        "good_above_target_fraction": round(
+                            out.info["good/above_target_fraction"], 4
                         ),
                         "logit_std": round(out.info.get("nce/logit_std", float("nan")), 5),
+                        "clip_t": round(cfg.clip_t, 4),
+                        "linear_branch_fraction": round(
+                            out.info["backup/linear_branch_fraction"], 4
+                        ),
                     },
                 )
+                # §7.12/§18. relu is INCREASING in Delta, so this sandwich is the mirror of
+                # L_step's and it is exact -- the only tolerance is fp rounding on the mean.
+                # A lower bound of 0 is legitimate (every good step already at or below c);
+                # a violation means L_good is not the relu of its own logged deltas, which is
+                # a wrong `c`, a wrong sign on `c`, or a wrong scope mask.
+                if out.info["good/terms"] > 0:
+                    c = cfg.good_margin
+                    lo = max(out.info["good/delta_min"] - c, 0.0)
+                    hi = max(out.info["good/delta_max"] - c, 0.0)
+                    good_now = float(out.terms["good"])
+                    assert lo - 1e-4 <= good_now <= hi + 1e-4, (
+                        f"L_good {good_now:.6f} outside relu sandwich [{lo:.6f}, {hi:.6f}] at "
+                        f"c = {c:.6f} (§7.12). Check the sign of good_margin first."
+                    )
                 checked_init = True
 
             if (micro + 1) % cfg.train.grad_accum == 0:
+                # TMD has no gradient clipping (optax.adam bare, tmd.py:341) and does not need
+                # it: its psi/phi sit on a small MLP with no backbone underneath. Here the same
+                # gradient also lands on LoRA inside a 1.5B model, and the LINEX is an exp() --
+                # one bad micro-batch is enough. The PRE-clip norm is logged every optimizer
+                # step so the clip stays auditable (§7.4.3): if train/grad_norm sits far above
+                # train.grad_clip for the whole run, the clip has stopped being a guard and is
+                # acting as an LR rescale -- raise it, do not leave it silently binding.
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad], cfg.train.grad_clip
+                )
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 step += 1
+                lr_now = optimizer.param_groups[0]["lr"]
+                lr_min_seen = min(lr_min_seen, lr_now)
+                lr_max_seen = max(lr_max_seen, lr_now)
 
                 if step % cfg.train.log_every == 0 or step == 1:
                     metrics = dict(out.info)
+                    metrics["train/grad_norm"] = float(grad_norm)
+                    metrics["train/grad_clipped"] = float(float(grad_norm) > cfg.train.grad_clip)
                     metrics.update(
                         batch_probes(
                             reps.psi, reps.phi, batch, goals, matrices, model.distance, cfg
                         )
                     )
+                    # §9.4 / §16.10: DIAGNOSTIC ONLY, never reported without a decision. It is
+                    # the direct test of the asymmetry claim that justifies a quasimetric over a
+                    # cosine similarity, and nothing in L_NCE/L_I/L_T supervises the reverse
+                    # distance -- so it is emergent, and it has to be watched from day one to be
+                    # worth anything later.
+                    metrics.update(asymmetry_score(reps.psi, batch, model.distance))
                     metrics["lr/backbone"] = optimizer.param_groups[0]["lr"]
                     metrics["lr/heads"] = optimizer.param_groups[-1]["lr"]
                     logger.log(step, metrics, console=True)
@@ -251,14 +320,32 @@ def main(argv: list[str] | None = None) -> int:
         if stop:
             break
 
-    if step > 0 and optimizer.param_groups[0]["lr"] == lr_before and cfg.train.schedule != "constant":
-        raise AssertionError("the LR never moved -- bug B6 (no scheduler) is back")
+    # ---- the B6 guard, and the checkpoint it is not allowed to eat ---------------------
+    # Read the LR over the WHOLE run, never start-vs-end. Two facts make start-vs-end fire on
+    # every run that FINISHES: LambdaLR's constructor applies lr_lambda(0), which is 0.0 under
+    # warmup, and a completed cosine ends at 0.5*(1+cos(pi)) = 0.0 exactly. So `lr_end ==
+    # lr_before` is 0.0 == 0.0 -- it passed only on runs cut short by --max-steps, i.e. exactly
+    # the ones whose checkpoints do not matter. It fired on 2026-07-27 after 971 good steps and
+    # took the final checkpoint with it, because the save sat BELOW the raise. It now sits
+    # above: a diagnostic must never destroy the artifact it is diagnosing.
+    lr_stuck = (
+        step > 0 and cfg.train.schedule != "constant" and lr_max_seen <= lr_min_seen
+    )
 
     save_checkpoint(
         Path(cfg.run.out_dir) / cfg.run.name / "final", model, cfg, tokenizer, step=step
     )
-    logger.event("done", {"optimizer_steps": step})
+    logger.event(
+        "done",
+        {"optimizer_steps": step, "lr_min": lr_min_seen, "lr_max": lr_max_seen},
+    )
     logger.close()
+
+    if lr_stuck:
+        raise AssertionError(
+            f"the LR never moved -- bug B6 (no scheduler) is back. It held {lr_max_seen:g} for "
+            f"all {step} optimizer steps. The final checkpoint was written first and is intact."
+        )
     return 0
 
 

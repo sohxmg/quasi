@@ -2,9 +2,14 @@
 
 §4.4 measured that ~95% of states have exactly one observed action -- essentially no natural
 branching, which is a fundamental difference from OGBench where trajectories cross
-constantly. The 4.5% that do branch are high-value: ~105,000 branch points across full
-train, ~63,000 with one correct and one incorrect continuation. That is "same state, right
-move vs wrong move", i.e. exactly the credit-assignment data.
+constantly. The 4.5% that do branch are high-value. **COUNTED on full train 2026-07-27:
+102,988 branching nodes, 30,344 of them correctness-disagreeing (29.5%)** -- normalised; 97,103
+and 28,551 on exact match. §4.4's "~63,000 disagreeing" was extrapolated from a 4,000-question
+sample and is 2.1x too high; the branching total it predicted (~105,000) was right. That is
+"same state, right move vs wrong move", i.e. exactly the credit-assignment data.
+
+Mining the SELECTED 23,000 training questions gives ~15,900 disagreeing points, not 30,344 --
+scale by the question count before comparing the two.
 
 **These are NOT L_CF data** (PLAN finding 2, a flagged deviation from §8.3). L_CF is a
 cross-entropy that needs a meaning-PRESERVING positive; a branch point is two

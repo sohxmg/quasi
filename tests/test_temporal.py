@@ -64,17 +64,59 @@ def test_nan_guard_gives_finite_loss_AND_finite_gradients(cfg):
     assert torch.isfinite(loss)
     loss.backward()
     assert torch.isfinite(Dist.grad).all()
-    assert info["backup/linear_branch_fraction"] == 1.0, "delta=200 > t=19.75 -> linear branch"
+    assert info["backup/linear_branch_fraction"] == 1.0, "delta=200 > t -> linear branch"
 
 
-def test_clip_t_scales_with_discount(cfg):
-    """t = clip_t_steps * (-log gamma): 28.5 reproduces TMD's bare t=3.0 at gamma=0.9, and
-    keeps the same slack at any discount (§7.4.3, locked #9a)."""
-    at_09 = dataclasses.replace(cfg, discount=0.9)
-    at_07 = dataclasses.replace(cfg, discount=0.7)
-    assert math.isclose(at_09.clip_t, 3.0, rel_tol=1e-3)
-    assert math.isclose(at_07.clip_t, 10.17, rel_tol=1e-3)
-    assert math.isclose(cfg.clip_t, 19.75, rel_tol=1e-3)
+def test_clip_t_bounds_the_exponent_not_a_step_count(cfg):
+    """t = log(clip_t_gain / gamma), so gamma*exp(t) == clip_t_gain at EVERY discount and the
+    steepest per-term gradient on Dist is clip_t_gain - 1 (§7.4.3, locked #9a).
+
+    20.0 reproduces TMD's bare t = 3.0 at TMD's own discount 0.99 -- not at the 0.9 the old
+    `clip_t_steps: 28.5` was anchored to, which TMD never runs."""
+    for discount in (0.5, 0.7, 0.9, 0.99):
+        at = dataclasses.replace(cfg, discount=discount)
+        assert math.isclose(at.backup_gain, at.losses.backup.clip_t_gain, rel_tol=1e-9)
+    assert math.isclose(dataclasses.replace(cfg, discount=0.99).clip_t, 3.0, abs_tol=0.01)
+    assert math.isclose(cfg.clip_t, 3.6889, rel_tol=1e-3)
+
+
+def test_clip_t_never_grows_with_the_step_cost(cfg):
+    """The regression this replaces. `t = clip_t_steps * (-log gamma)` made the guard LOOSER
+    exactly as the step cost grew: at discount 0.5 it reached 19.75, and exp(19.75) = 3.8e8 is
+    no guard at all -- the measured backup at step 0 was +8760.29 against an expected -10.53.
+
+    Whatever the discount, the exponential branch must stay bounded by a small constant."""
+    for discount in (0.5, 0.7, 0.9, 0.99):
+        at = dataclasses.replace(cfg, discount=discount)
+        assert at.clip_t < 5.0, f"t = {at.clip_t} at discount {discount} does not bound exp()"
+        assert math.exp(at.clip_t) < 200.0
+
+    # ...and it must still be loose enough for the loss's OWN minimiser, delta = -log gamma,
+    # to sit inside the exponential branch. A guard that clips the target cannot converge.
+    for discount in (0.5, 0.7, 0.9, 0.99):
+        at = dataclasses.replace(cfg, discount=discount)
+        assert at.neg_log_gamma < at.clip_t
+
+
+def test_init_offset_rides_the_linear_branch_and_stays_tame(cfg):
+    """At step 0 psi and phi are independent networks, so Dist ~ 11 (unrelated 512-d latents)
+    while Next ~ 1.3 (psi against itself on anisotropic LM hiddens): delta ~ 9.8. That is the
+    real measured init state (§7.4.3), and the clip must turn it into a number of order delta
+    rather than gamma*exp(9.8) ~ 1.7e4."""
+    Next = torch.full((8, 8), 1.26)
+    Dist = torch.full((8, 8), 11.03, requires_grad=True)
+    loss, info = temporal_loss(
+        Dist, Next, torch.arange(8), torch.ones(8, 8, dtype=torch.bool), cfg
+    )
+    assert info["backup/linear_branch_fraction"] == 1.0
+    assert math.isclose(float(loss), 11.03 - 1.26, rel_tol=1e-4)
+    loss.backward()
+    # Linear branch: d(div)/d(Dist) == 1 per term, and L_T is a weighted mean whose weights sum
+    # to 1 (diag_backup reweights the matched entries, §7.4.2), so the WHOLE backup contributes
+    # a total gradient of exactly 1.0 -- no exp(), nothing for zeta = 0.05 to amplify.
+    # Under the old t = 19.75 this same fixture put gamma*exp(9.77) ~ 8.8e3 on every entry.
+    assert math.isclose(float(Dist.grad.sum()), 1.0, rel_tol=1e-5)
+    assert float(Dist.grad.max()) < 0.1
 
 
 def test_goal_scope_ratio_interpolates_batch_and_same_question(cfg):

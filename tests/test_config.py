@@ -22,6 +22,7 @@ def test_defaults_match_the_locked_decisions(cfg):
     assert cfg.losses.lambda_step == 1.0                         # not optional (§7.6.2)
     assert cfg.sampling.nce_mask_same_traj is False              # locked #12
     assert cfg.sampling.sequences_per_micro_batch == 56          # §8.1
+    assert cfg.sampling.max_padded_tokens == 32768               # measured 2026-07-27
     assert cfg.model.name == "Qwen/Qwen2.5-Math-1.5B-Instruct"
 
 
@@ -30,12 +31,14 @@ def test_derived_values_match_section_7_8s_table(cfg):
 
     assert math.isclose(cfg.neg_log_gamma, 0.69315, rel_tol=1e-4)
     assert math.isclose(cfg.step_margin, 1.38629, rel_tol=1e-4)
-    assert math.isclose(cfg.clip_t, 19.75, rel_tol=1e-3)
+    # clip_t is log(clip_t_gain / discount) -- it moves AGAINST neg_log_gamma, not with it
+    # (§7.4.3). 3.6889 at 0.5, 3.3524 at 0.7.
+    assert math.isclose(cfg.clip_t, 3.6889, rel_tol=1e-3)
 
     fallback = dataclasses.replace(cfg, discount=0.7)
     assert math.isclose(fallback.neg_log_gamma, 0.35667, rel_tol=1e-4)
     assert math.isclose(fallback.step_margin, 0.71335, rel_tol=1e-4)
-    assert math.isclose(fallback.clip_t, 10.17, rel_tol=1e-3)
+    assert math.isclose(fallback.clip_t, 3.3524, rel_tol=1e-3)
 
 
 def test_unknown_key_is_a_hard_error():

@@ -4,11 +4,19 @@ Old bug B4 was "config value silently ignored, library default used instead". So
 is typed, and an unknown or misspelled key is a hard error with the offending path and the
 closest legal name.
 
-Three quantities are DERIVED from `discount` and must never be set independently (§7.8):
+Four quantities are DERIVED from `discount` and must never be set independently (§7.8):
 
     neg_log_gamma = -log(discount)          per-good-step cost
     step_margin   = margin_steps * neg_log_gamma        (5) L_step's m      §7.6.4
-    clip_t        = clip_t_steps * neg_log_gamma        (3) L_T's t         §7.4.3
+    good_margin   = -margin_steps * neg_log_gamma       (6) L_good's c      §7.12  NEGATIVE
+    clip_t        = log(clip_t_gain / discount)         (3) L_T's t         §7.4.3
+
+`step_margin` and `good_margin` read DIFFERENT `margin_steps` keys (`losses.step_loss` and
+`losses.good_loss`) and carry opposite signs. `m` is a positive floor on the error step's
+Delta; `c` is the negative target a good step's Delta must not exceed.
+
+`clip_t` is derived from `discount` but it does NOT scale with `neg_log_gamma` -- it moves the
+other way, by `log(1/gamma)`. See §7.4.3: `t` bounds an exponent, not a step count.
 """
 
 from __future__ import annotations
@@ -103,12 +111,15 @@ class DataConfig:
 @dataclass(frozen=True)
 class SamplingConfig:
     sequences_per_micro_batch: int = 56
+    max_padded_tokens: int = 32768
     max_correct_per_question: int = 4
     max_incorrect_per_question: int = 3
     nce_mask_same_traj: bool = False
     group_by_length: bool = True
 
     def __post_init__(self) -> None:
+        if self.max_padded_tokens < 1:
+            raise ConfigError("sampling.max_padded_tokens must be >= 1")
         if self.max_correct_per_question < 1 or self.max_incorrect_per_question < 1:
             raise ConfigError(
                 "sampling caps must be >= 1: L_step needs one correct trajectory for its "
@@ -144,8 +155,38 @@ class StepLossConfig:
 
 
 @dataclass(frozen=True)
+class GoodLossConfig:
+    """(6) L_good internals (§7.12). `margin_steps` here is the TARGET, not a slack."""
+
+    margin_steps: float = 1.0
+    form: str = "relu"
+    include_incorrect_prefix: bool = True
+    detach_goal: bool = False
+    warmup_steps: int = 100
+
+    def __post_init__(self) -> None:
+        _one_of("losses.good_loss.form", self.form, ("relu", "softplus"))
+        if self.warmup_steps < 0:
+            raise ConfigError(
+                f"losses.good_loss.warmup_steps must be >= 0, got {self.warmup_steps}. "
+                "0 means full weight from step 1, not 'no L_good'."
+            )
+        if self.margin_steps <= 0.0:
+            # `cfg.good_margin` is -margin_steps * neg_log_gamma and it MUST come out
+            # negative: it is where a good step is supposed to land, -0.693 at discount 0.5.
+            # A non-positive margin_steps puts c at 0 or above, which trains good steps to
+            # move AWAY from the goal -- and that converges cleanly, so no curve would show
+            # it. The sign is checked here because it cannot be checked later.
+            raise ConfigError(
+                f"losses.good_loss.margin_steps must be > 0, got {self.margin_steps}. It is a "
+                "step count that is NEGATED into the target c = -margin_steps * (-log gamma) "
+                "= -0.693 at discount 0.5. Do not pre-negate it here (§7.12)."
+            )
+
+
+@dataclass(frozen=True)
 class BackupConfig:
-    clip_t_steps: float = 28.5
+    clip_t_gain: float = 20.0
     diag_backup: float = 0.5
     goal_scope_ratio: float = 1.0
     stopgrad_psi_backup: bool = False
@@ -153,6 +194,12 @@ class BackupConfig:
     def __post_init__(self) -> None:
         _in_unit("losses.backup.diag_backup", self.diag_backup)
         _in_unit("losses.backup.goal_scope_ratio", self.goal_scope_ratio)
+        if self.clip_t_gain <= 1.0:
+            raise ConfigError(
+                f"losses.backup.clip_t_gain must be > 1, got {self.clip_t_gain}. It is the cap "
+                "on the LINEX exponential term gamma*exp(t); at <= 1 the guard clips below the "
+                "loss's own minimiser (delta = -log gamma) and the backup can never converge."
+            )
 
 
 @dataclass(frozen=True)
@@ -162,15 +209,19 @@ class LossesConfig:
     zeta: float = 0.05
     lambda_cf: float = 0.0
     lambda_step: float = 1.0
+    lambda_good: float = 0.0
     nce_temperature: float = 1.0
     action_invariance: ActionInvarianceConfig = field(default_factory=ActionInvarianceConfig)
     step_loss: StepLossConfig = field(default_factory=StepLossConfig)
+    good_loss: GoodLossConfig = field(default_factory=GoodLossConfig)
     backup: BackupConfig = field(default_factory=BackupConfig)
     stopgrad_phi_invariance: bool = False
 
     def __post_init__(self) -> None:
         if self.nce_temperature <= 0:
             raise ConfigError("losses.nce_temperature must be > 0")
+        if self.lambda_good < 0:
+            raise ConfigError("losses.lambda_good must be >= 0")
         if self.lambda_step > 0 and self.action_invariance.mode != "diagonal":
             raise ConfigError(
                 "losses.action_invariance.mode != 'diagonal' with lambda_step > 0. The grid "
@@ -192,6 +243,7 @@ class TrainConfig:
     betas: tuple[float, float] = (0.9, 0.95)
     weight_decay: float = 0.0
     bf16: bool = True
+    grad_clip: float = 1.0
     log_every: int = 10
     save_every: int = 250
     max_steps: Optional[int] = None
@@ -200,6 +252,8 @@ class TrainConfig:
         _one_of("train.schedule", self.schedule, ("cosine", "constant"))
         if self.grad_accum < 1:
             raise ConfigError("train.grad_accum must be >= 1")
+        if self.grad_clip <= 0:
+            raise ConfigError("train.grad_clip must be > 0 (0 does not mean 'off')")
 
 
 @dataclass(frozen=True)
@@ -246,6 +300,18 @@ class Config:
     def __post_init__(self) -> None:
         if not 0.0 < self.discount < 1.0:
             raise ConfigError(f"discount must be in (0, 1), got {self.discount}")
+        one_question = (
+            self.sampling.max_correct_per_question + self.sampling.max_incorrect_per_question
+        ) * self.data.max_len
+        if self.sampling.max_padded_tokens < one_question:
+            raise ConfigError(
+                f"sampling.max_padded_tokens ({self.sampling.max_padded_tokens}) is below one "
+                f"question's worst-case padded cost ({one_question} = "
+                f"{self.sampling.max_correct_per_question + self.sampling.max_incorrect_per_question}"
+                f" seqs x data.max_len {self.data.max_len}). No question is ever split (PLAN "
+                "'Core design decisions' 4), so the cap would be exceeded by single-question "
+                "batches and would not bound peak memory at all."
+            )
         per = self.heads.latent_dim / self.distance.components
         if per != int(per) or int(per) % 2 != 0:
             raise ConfigError(
@@ -267,9 +333,37 @@ class Config:
         return self.losses.step_loss.margin_steps * self.neg_log_gamma
 
     @property
+    def good_margin(self) -> float:
+        """(6) L_good's `c`. **NEGATIVE**: -0.69315 at discount 0.5, margin_steps 1.0 (§7.12).
+
+        It is the target `Delta` of a good step -- the same `-log gamma` (3) `L_T` prices a
+        step at -- expressed as the point where `relu` switches on. The sign is the whole
+        content of this property: `+0.693` trains good steps to move one step AWAY from the
+        goal per step, and it converges just as cleanly, so nothing downstream would catch it.
+        Opposite convention to `step_margin`, which is a positive threshold on `Delta_{z+1}`.
+        """
+        return -self.losses.good_loss.margin_steps * self.neg_log_gamma
+
+    @property
     def clip_t(self) -> float:
-        """(3) L_T's LINEX clip t. 19.75 at discount 0.5 with clip_t_steps 28.5."""
-        return self.losses.backup.clip_t_steps * self.neg_log_gamma
+        """(3) L_T's LINEX clip t, 3.689 at discount 0.5 with clip_t_gain 20.0 (§7.4.3).
+
+        `t` caps the exponential branch at `gamma*exp(t) = clip_t_gain`, so the steepest
+        per-term gradient the backup can put on `Dist` is `clip_t_gain - 1`. Solving for `t`:
+
+            t = log(clip_t_gain / gamma)
+
+        `clip_t_gain = 20` reproduces TMD's bare `t = 3.0` at TMD's OWN `discount = 0.99`
+        (0.99*e^3 = 19.9). At our 0.5 it gives 3.689, at the 0.7 fallback 3.352.
+        """
+        return math.log(self.losses.backup.clip_t_gain / self.discount)
+
+    @property
+    def backup_gain(self) -> float:
+        """The realised cap on the LINEX exponential, `gamma*exp(clip_t)`. Equals
+        `clip_t_gain` by construction -- kept as a property so the launch log can print the
+        quantity that is actually bounded rather than the knob that sets it."""
+        return self.discount * math.exp(self.clip_t)
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -281,7 +375,9 @@ class Config:
         payload["_derived"] = {
             "neg_log_gamma": self.neg_log_gamma,
             "step_margin": self.step_margin,
+            "good_margin": self.good_margin,
             "clip_t": self.clip_t,
+            "backup_gain": self.backup_gain,
         }
         path.write_text(yaml.safe_dump(payload, sort_keys=False))
 

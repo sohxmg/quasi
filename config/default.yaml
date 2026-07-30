@@ -42,7 +42,19 @@ data:
   max_len: 1024                  # rows over this are DROPPED, never truncated (~0.05%, logged)
   sep_token: "\n"                # asserted to be exactly one token id at load (§6.1)
   prompt_format: raw             # raw (CRM-faithful) | chat (Qwen chat template)
-  n_questions: 23000             # x 4.33 seqs/question = ~100k seqs/epoch (NOT 9.18 - §11.1)
+  n_questions: 34650             # x 4.33 seqs/question = ~150k seqs/epoch (NOT 9.18 - §11.1)
+                                 # RAISED 23000 -> 34650 on 2026-07-28, with the L_good run.
+                                 # 34650 x 4.33 = 150,035 sequences -> ~1,460 optimizer steps
+                                 # measured-rate (~1,340 analytic; the token cap makes real
+                                 # batches ~51 seqs, not 56 - §8.1.2).
+                                 # THE POOL IS ~38,247 (40,247 trainable minus the 2,000 val
+                                 # holdout), so this takes 91% of it. There is no room for a
+                                 # third increase: past ~38k the only lever is train.epochs.
+                                 # CHANGING THIS CHANGES THE SELECTION SHA -> re-run
+                                 # scripts/prepare_data.py before training, or the parquet
+                                 # still holds the 23,000-question selection. The VAL split is
+                                 # unaffected (it is drawn before n_questions is applied), so
+                                 # val_f1 numbers stay comparable across the change.
   n_val_questions: 2000
 
 # ===================== THE ONE DISCOUNT (locked #9) =====================
@@ -56,6 +68,23 @@ discount: 0.5                    # CHOSEN 2026-07-25. -log = 0.69315, 41.1% endi
 
 sampling:
   sequences_per_micro_batch: 56
+  max_padded_tokens: 32768       # THE SECOND BUDGET. A batch closes when it would break
+                                 # either this or the sequence count, because a batch costs
+                                 # len(batch) x max_len on the GPU, not len(batch).
+                                 # MEASURED 2026-07-27 (scripts/batch_report.py), after the
+                                 # PLAN 4a probe OOMed at 57,344 tok on a 15.46 GiB card:
+                                 #   lengths p50 248, p90 514, 0.7% above 896 -> the median
+                                 #   batch is 19,423 tok and the worst is 57,344, so only
+                                 #   17% of batches are over this cap.
+                                 # 32768 costs 5% of L_NCE's mean pool (R 364 -> 344) and
+                                 # NOTHING at p10 (177 -> 176): thin pools live on SHORT
+                                 # batches, oversized batches carry the LARGEST pools.
+                                 # Cutting sequences_per_micro_batch instead shrinks every
+                                 # batch: 28 seqs halves R to 175 and Q to 6.0. Do that only
+                                 # if the cap alone cannot fit the card.
+                                 # ~11.5 GiB peak, 1943 batches, 971 steps, grad_accum stays 2.
+                                 # 40960 measures ~13.4 GiB - inside the error bar. Re-run
+                                 # batch_report.py before raising it.
   max_correct_per_question: 4    # CAPS, not quotas: min(cap, available). median is 2. §4.2.1
   max_incorrect_per_question: 3
   nce_mask_same_traj: false      # locked #12 - we want the negatives
@@ -69,6 +98,28 @@ losses:
   zeta: 0.05                     # (3) L_T     §7.4  weights the BACKUP ONLY - tmd.py:124
   lambda_cf: 0.0                 # (4) L_CF    §7.5  data deferred (§2 #4)
   lambda_step: 1.0               # (5) L_step  §7.6  carries correctness. not optional (§7.6.2)
+  lambda_good: 1.0               # (6) L_good  §7.12 THE FALSE-POSITIVE TERM. ON since
+                                 # 2026-07-28 - the §16.21 sign-off, given by the human after
+                                 # the step-750 measurement below. It shipped at 0.0 for
+                                 # exactly one day.
+                                 # Nothing else in the loss set bounds a good step's Delta
+                                 # from ABOVE: at L_I's optimum the MRN forces
+                                 # d(phi_i,g) >= d(psi_{i-1},g), so the -A term of
+                                 #   Delta_i = -0.693 - A_i - B_i
+                                 # is >= 0 with no ceiling. Measured at step 750: good-step
+                                 # Delta mean +0.240, P(Delta > 0.347) = 0.34, fitted tau
+                                 # driven to 2.39, F1 capped at 0.456 (§7.12).
+                                 # 1.0 is UNVALIDATED like every other weight (§16.8). The
+                                 # weak claim is that it does not drown L_step (~660 terms vs
+                                 # ~67 pairs) -- MEASURED SMALL: probe03/gap RISES with lambda.
+                                 # The real cost is L_I (0.098 -> 0.260 at 1.0, §7.12), so
+                                 # WATCH invariance/residual_diagonal: above ~0.15 at step 200,
+                                 # or rising after it settles, halve this. Never compensate
+                                 # with good_loss.margin_steps.
+                                 # --set losses.lambda_good=0.0 restores the inert term, which
+                                 # still logs its diagnostics.
+                                 # A loss-set change invalidates the checkpoint: train FRESH,
+                                 # never resume step750.
   nce_temperature: 1.0           # tmd.py:92 uses sqrt(512)=22.6; we diverge (bug B10a, §7.2).
                                  # float, not a boolean - raise it if logit_std blows up
   action_invariance:
@@ -84,10 +135,57 @@ losses:
                                  # z is 0-BASED (§6.1). The last two are §7.10 expansions, OFF.
                                  # position_corrected needs margin_steps 2.0 -> 3.0 (§7.10).
     exclude_recovery: false       # the 1.48% False->True trajectories (§16.15)
+  good_loss:                     # (6) L_good internals - §7.12
+    margin_steps: 1.0            # c = -margin_steps * (-log discount) = -0.69315 at 0.5.
+                                 # **NEGATIVE**, and that is the whole point: c is the TARGET
+                                 # a good step's Delta must not exceed, the same -log gamma
+                                 # (3) L_T prices a step at. Not a slack allowance.
+                                 # The wrong sign (c = +0.693) trains good steps one step
+                                 # AWAY from the goal per step and CONVERGES CLEANLY - no
+                                 # curve would show it. config.py rejects margin_steps <= 0
+                                 # so the negation happens in exactly one place.
+    form: relu                   # relu | softplus.  USE RELU.
+                                 # Delta >= -0.693 is a hard floor implied by L_I + L_T, so
+                                 # pushing past it costs one of them. softplus applies half
+                                 # its gradient AT the target and never reaches zero:
+                                 #   base      P(D>tau) 0.229  ruler 1.201  -B -0.97  D +0.240
+                                 #   softplus  P(D>tau) 0.000  ruler 1.283  -B -1.42  D -1.556
+                                 #   relu      P(D>tau) 0.000  ruler 1.222  -B -0.95  D -0.834
+                                 # SIMULATED ON FREE LATENTS (§7.12), same seed and data.
+                                 # softplus overshoots the ruler by 2.2 steps and breaks L_T.
+    include_incorrect_prefix: true   # also train i <= z of INCORRECT trajectories - they are
+                                 # on-track states and eval scores them the same way. i = z+1
+                                 # is L_step's pair and is excluded either way; so is i > z+1,
+                                 # where no loss defines what Delta should be.
+    warmup_steps: 100            # LINEAR ramp on lambda_good over the first 100 optimizer
+                                 # steps (~7% of a 1,464-step run). 0 = full weight from step 1.
+                                 # relu is why this exists: every other term tapers near its
+                                 # target, relu applies FULL gradient the whole time it is
+                                 # violated and then stops dead. So L_good would hit at full
+                                 # strength from step 1 -- during exactly the ~100 steps when
+                                 # L_I has not closed the psi/phi gap and L_T is still on the
+                                 # LINEX LINEAR branch, i.e. when the ruler that `c` is
+                                 # expressed in DOES NOT EXIST YET.
+                                 # The measured cost of L_good is paid by L_I (0.098 -> 0.260
+                                 # at lambda 1.0, §7.12) and the first 100 steps are when L_I
+                                 # is largest. Ramps the weight, never the term: every good/*
+                                 # diagnostic stays unscaled. good/lambda_effective logs it.
+    detach_goal: false           # §16.17 in reverse: L_good pulls d(psi_i, g) DOWN, and with
+                                 # g attached the cheapest route is to drag the correct
+                                 # terminals onto the trajectory - the very vectors phase 2's
+                                 # goal head must predict. Watch diagnostic #5; if `within`
+                                 # grows while the §10.1 gate worsens, set this true.
   backup:
-    clip_t_steps: 28.5           # t = clip_t_steps * (-log discount). SCALE-FREE.
-                                 # 28.5 reproduces TMD's bare t=3.0 (tmd.py:363) at gamma=0.9
-                                 # -> t = 19.75 at 0.5, 10.17 at 0.7.  §7.4.3
+    clip_t_gain: 20.0            # t = log(clip_t_gain / discount).  §7.4.3
+                                 # t bounds an EXPONENT, not a step count: it caps the LINEX
+                                 # term at gamma*exp(t) = clip_t_gain, so the steepest gradient
+                                 # the backup can put on Dist is clip_t_gain - 1.
+                                 # 20.0 reproduces TMD's bare t=3.0 (tmd.py:363) at TMD's OWN
+                                 # discount 0.99 (0.99*e^3 = 19.9) -> t = 3.689 at 0.5, 3.352
+                                 # at 0.7.  The old `clip_t_steps: 28.5` was anchored at
+                                 # gamma=0.9, which TMD never runs, and gave t=19.75 at 0.5:
+                                 # exp(19.75) = 3.8e8, no guard at all. That is the 8760.29
+                                 # backup at step 0. DO NOT reintroduce a step-count form.
     diag_backup: 0.5             # tmd.py:364. weight on MATCHED (source, its own goal) pairs
     goal_scope_ratio: 1.0        # OURS, no TMD counterpart. within the non-matched mass:
                                  # 1.0 = whole batch (TMD-faithful) | 0.0 = same-question only
@@ -98,7 +196,8 @@ losses:
 
 train:
   epochs: 1
-  grad_accum: 2                  # -> ~889 optimizer steps. ASSERTED at launch (§11.1).
+  grad_accum: 2                  # -> ~1,460 optimizer steps at n_questions 34650, measured
+                                 # rate. ASSERTED at launch (§11.1).
                                  # If GPU time is short cut n_questions, NEVER raise this alone.
   lr_backbone: 9.0e-6
   lr_heads: 3.0e-4               # fresh head params only
@@ -107,6 +206,12 @@ train:
   betas: [0.9, 0.95]
   weight_decay: 0.0
   bf16: true
+  grad_clip: 1.0                 # TMD has none (bare optax.adam, tmd.py:341) and needs none:
+                                 # no backbone under its heads. We clip because the same
+                                 # gradient reaches LoRA inside a 1.5B model and L_T is an
+                                 # exp(). The PRE-clip norm is logged as train/grad_norm every
+                                 # optimizer step: if it sits far above 1.0 all run, the clip
+                                 # has become an LR rescale rather than a guard - raise it.
   log_every: 10
   save_every: 250
   max_steps: null                # dev/smoke override

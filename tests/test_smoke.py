@@ -117,8 +117,11 @@ def test_zeta_weights_the_backup_only(cfg):
         + cfg.losses.zeta * out.terms["backup"]
         + cfg.losses.lambda_cf * out.terms["cf"]
         + cfg.losses.lambda_step * out.terms["step"]
+        + cfg.losses.lambda_good * out.terms["good"]      # §7.12, 0.0 by default
     )
     assert torch.allclose(out.total, manual, atol=1e-6)
+    # ...and the sum is over the WHOLE terms dict, so a seventh term cannot slip in unweighted
+    assert set(out.terms) == {"nce", "invariance", "backup", "cf", "step", "good"}
 
 
 def test_cf_is_inert_at_lambda_zero(cfg):

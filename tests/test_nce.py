@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
 from feynman_prm.losses.nce import nce_loss
@@ -90,3 +91,59 @@ def test_temperature_is_a_float_knob():
     _, hot = nce_loss(Dist, pos_row, temperature=1.0)
     _, cold = nce_loss(Dist, pos_row, temperature=22.6)
     assert cold["nce/logit_std"] < hot["nce/logit_std"] / 10
+
+
+def _split_fixture(n_questions=11, rows_per_question=32, sep=12.0, seed=0):
+    """A batch shaped like the real one (§8.1.1: R ~ 348, Q ~ 11-13), where cross-question
+    separation is PERFECT and within-question ordering is pure noise."""
+    torch.manual_seed(seed)
+    R = n_questions * rows_per_question
+    row_q = torch.arange(R) % n_questions
+    C = n_questions                                   # one goal column per question
+    goal_q = torch.arange(C)
+    SQ = row_q[:, None] == goal_q[None, :]
+    Dist = torch.rand(R, C) + torch.where(SQ, 0.0, sep)   # same-question rows are all close
+    pos_row = torch.tensor([int((row_q == q).nonzero()[0]) for q in range(C)])
+    return Dist, pos_row, SQ, rows_per_question - 1
+
+
+def test_nce_loss_floors_at_log_of_the_same_question_pool():
+    """WHY `nce/loss` stalls around 3.5 and more data will not move it (§16.4).
+
+    With cross-question negatives fully separated and within-question ordering at chance, the
+    softmax mass is exactly the same-question pool, so the loss sits at log(1 + n_same) -- at
+    the measured Q = 11 and R ~ 348 that is log(32) = 3.47. `nce/loss` alone cannot tell this
+    apart from undertraining; the split can."""
+    Dist, pos_row, SQ, n_same = _split_fixture()
+    loss, info = nce_loss(Dist, pos_row, SQ=SQ)
+
+    assert info["nce/negatives_same_question"] == pytest.approx(n_same, abs=0.01)
+    assert float(loss) == pytest.approx(math.log(1 + n_same), abs=0.15)
+    assert float(loss) == pytest.approx(info["nce/floor_same_question"], abs=0.15)
+
+    # ...while cross-question discrimination is in fact solved, and the split says so.
+    assert info["nce/loss_cross_question"] < 0.01
+    assert info["nce/accuracy_within_question"] == pytest.approx(1 / (1 + n_same), abs=0.15)
+
+    # and the level is set by Q, not by how well the model has learned: fewer questions in the
+    # batch means a bigger same-question pool and a HIGHER floor, at identical geometry.
+    wide, wide_pos, wide_SQ, wide_n = _split_fixture(n_questions=22, rows_per_question=16)
+    wide_loss, wide_info = nce_loss(wide, wide_pos, SQ=wide_SQ)
+    assert float(wide_loss) < float(loss)
+    assert wide_info["nce/floor_same_question"] < info["nce/floor_same_question"]
+
+
+def test_within_question_learning_shows_up_in_the_split_not_in_nce_loss():
+    """The point of the split: real progress is within-question ranking, and it moves
+    `accuracy_within_question` long before it moves `nce/loss` much."""
+    Dist, pos_row, SQ, n_same = _split_fixture()
+    _, chance = nce_loss(Dist, pos_row, SQ=SQ)
+
+    # now order the same-question rows correctly: the positive is nearest within its question
+    Dist = Dist.clone()
+    Dist[pos_row, torch.arange(Dist.shape[1])] -= 6.0
+    learned_loss, learned = nce_loss(Dist, pos_row, SQ=SQ)
+
+    assert learned["nce/accuracy_within_question"] == 1.0
+    assert chance["nce/accuracy_within_question"] < 0.2
+    assert float(learned_loss) < 0.2, "only within-question ranking can get below the floor"

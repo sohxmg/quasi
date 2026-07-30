@@ -7,7 +7,13 @@ existed: it was a MODELLING failure, not a plumbing failure. Probes #9, #10, #13
 **#14 is the one to watch** -- the three-way Delta histogram is what predicts ProcessBench
 F1 (§7.6.6). L_step never sees a correct trajectory, so L_T alone suppresses false
 positives; a positive Delta tail on good steps of CORRECT trajectories is F1 leaking with no
-loss training against it, and that is the trigger for a §7.10 pairing expansion.
+loss training against it.
+
+**That trigger fired on 2026-07-27** and the answer was (6) `L_good` (§7.12), not a §7.10
+pairing expansion -- the tail is a one-sided hole in the loss set, not a shortage of `L_step`
+terms. **Read the QUANTILES, not the mean.** `delta_good_of_correct/mean` was `+0.240` at
+step 750, which reads like a small bounded offset; `frac_above_natural` was `0.34`, which is
+a third of all good steps firing as false positives and is what actually capped F1 at 0.456.
 """
 
 from __future__ import annotations
@@ -18,7 +24,8 @@ from torch import Tensor
 from ..config import Config
 from ..data.collate import Batch
 from ..data.goals import GoalIndex
-from ..losses.matrix import Matrices
+from ..eval.calibrate import natural_tau
+from ..losses.matrix import Matrices, step_deltas
 from ..model.distances import Distance
 
 
@@ -70,20 +77,11 @@ def batch_probes(
     # its own terminal ends at d(x,x) and would distort the histogram).
     D_term = matrices.D_term
     if D_term.numel() and batch.n_rows:
-        row_q = batch.traj_qid[batch.row_traj]                      # (R,)
-        term_q = batch.traj_qid[matrices.terminal_traj]             # (T_c,)
-        valid = (row_q[:, None] == term_q[None, :]) & (
-            batch.row_traj[:, None] != matrices.terminal_traj[None, :]
-        )
-        delta = D_term[batch.row_dst] - D_term[batch.row_src]       # (R, T_c)
-
-        row_correct = batch.traj_correct[batch.row_traj]
-        z = batch.traj_z[batch.row_traj]
-        i = batch.row_step
-        good_correct = valid & row_correct[:, None]
-        good_incorrect = valid & (~row_correct & (i <= z))[:, None]
-        boundary = valid & (~row_correct & (i == z + 1))[:, None]
-        post_error = valid & (~row_correct & (i > z + 1))[:, None]
+        # ONE definition of Delta, shared with (6) L_good (matrix.step_deltas, §7.12). The
+        # probe detaches; the loss keeps the graph. Before the extraction this block was the
+        # only place Delta existed, and the tail it measured had no loss opposing it.
+        sd = step_deltas(D_term, batch, matrices.terminal_traj).detach()
+        valid, delta = sd.valid, sd.delta
 
         def stat(mask: Tensor, name: str) -> None:
             vals = delta[mask]
@@ -96,13 +94,36 @@ def batch_probes(
 
         # #2 good steps vs the target -log gamma; #3 the gap to bad steps; #14 the three-way
         # histogram. The old project's #2 was 108x off and nobody noticed.
-        stat(good_correct, "probe14/delta_good_of_correct")
-        stat(good_incorrect, "probe14/delta_good_of_incorrect")
-        stat(boundary, "probe14/delta_boundary")
-        stat(post_error, "probe14/delta_post_error")
+        stat(sd.good_correct, "probe14/delta_good_of_correct")
+        stat(sd.good_incorrect, "probe14/delta_good_of_incorrect")
+        stat(sd.boundary, "probe14/delta_boundary")
+        stat(sd.post_error, "probe14/delta_post_error")
+
+        # ---- #14's TAIL. The mean hid this for a whole run ----------------------------
+        # At step 750 `delta_good_of_correct/mean` read +0.240 and looked like a bounded
+        # offset. It was not: 34% of good steps sat above the natural tau, tau had to climb
+        # to 2.39 to dodge them, and F1 capped at 0.456 (§7.12). **The quantiles are what
+        # decide F1**, so they are logged next to the mean and not derived from it.
+        tau_natural = natural_tau(cfg)
+        thresholds = {"0": 0.0, "natural": tau_natural, "1": 1.0, "2": 2.0}
+
+        def tail(mask: Tensor, name: str) -> None:
+            vals = delta[mask]
+            for label, thr in thresholds.items():
+                out[f"{name}/frac_above_{label}"] = (
+                    float((vals > thr).float().mean()) if vals.numel() else float("nan")
+                )
+            for q in (0.90, 0.99):
+                out[f"{name}/p{int(q * 100)}"] = (
+                    float(torch.quantile(vals.float(), q)) if vals.numel() else float("nan")
+                )
+
+        tail(sd.good_correct, "probe14/delta_good_of_correct")
+        tail(sd.good_incorrect, "probe14/delta_good_of_incorrect")
+        out["probe14/natural_tau"] = tau_natural
         out["probe02/target_good_step_delta"] = -cfg.neg_log_gamma
-        good_all = delta[good_correct | good_incorrect]
-        bad_all = delta[boundary]
+        good_all = delta[sd.good_correct | sd.good_incorrect]
+        bad_all = delta[sd.boundary]
         out["probe02/delta_good_mean"] = float(good_all.mean()) if good_all.numel() else float("nan")
         out["probe03/delta_bad_mean"] = float(bad_all.mean()) if bad_all.numel() else float("nan")
         # #3: THIS GAP IS THE SIGNAL. Collapsing toward zero means the error signal is being

@@ -71,7 +71,7 @@ def load_backbone(cfg: Config, trainable: bool = True):
     if not trainable:
         for p in model.parameters():
             p.requires_grad_(False)
-        return model
+        return model.eval()
 
     lora = LoraConfig(
         r=cfg.model.lora.r,
@@ -81,6 +81,17 @@ def load_backbone(cfg: Config, trainable: bool = True):
         bias="none",
         task_type=TaskType.FEATURE_EXTRACTION,
     )
+    # `autocast_adapter_dtype` is left at PEFT's default True, so the LoRA weights are fp32
+    # under a bf16 base and `lora/layer.py` casts every adapted projection's INPUT to fp32,
+    # retained for backward. Across the 7 targets that is 6*1536 + 8960 = 18,176 elements
+    # per token at double width: ~1.1 GiB at a 32k-token batch, ~1.9 GiB at 57k, one decoder
+    # layer live at a time under checkpointing. It is what the 1.91 GiB allocation in the
+    # 2026-07-26 OOM was (57,344 x 8,960 x 4 B, down_proj's input, exactly).
+    # A MEMORY LEVER HELD IN RESERVE, not a bug: passing autocast_adapter_dtype=False buys
+    # that back and would make a 40960 token cap comfortable. Not taken, because
+    # sampling.max_padded_tokens=32768 already leaves ~4 GiB free and this is a numerics
+    # change on 22.4M trainable params in a repo that is deliberate about fp32 (§6.3 heads,
+    # bug B10a distances). Flip it only with a §18 init-value check.
     model = get_peft_model(model, lora)
 
     if cfg.model.gradient_checkpointing:
@@ -88,7 +99,73 @@ def load_backbone(cfg: Config, trainable: bool = True):
         # Required for gradient checkpointing when the forward is given `inputs_embeds`
         # instead of `input_ids` (which is how the action embedding comes out free, PLAN 2).
         model.enable_input_require_grads()
+
+    # `from_pretrained` returns the model in EVAL mode, and `get_peft_model` wraps it in a fresh
+    # nn.Module whose own `.training` is True -- so `peft_model.training` reads True while all 28
+    # Qwen2DecoderLayers underneath read False. Nothing propagates train mode upward or downward
+    # at wrap time. See arm_gradient_checkpointing for what that silently costs.
+    model.train()
+
+    if cfg.model.gradient_checkpointing:
+        arm_gradient_checkpointing(model)
     return model
+
+
+def arm_gradient_checkpointing(model: torch.nn.Module) -> int:
+    """Assert gradient checkpointing will ACTUALLY run, and arm any layer that would not.
+
+    `GradientCheckpointingLayer.__call__` (transformers/modeling_layers.py) reads TWO things,
+    and neither of them is the flag on the Qwen2Model that `gradient_checkpointing_enable()`
+    is easiest to verify through:
+
+        if self.gradient_checkpointing and self.training:      # <- both, per LAYER
+            return self._gradient_checkpointing_func(...)
+        return super().__call__(*args, **kwargs)               # <- silent full-activation path
+
+    When either is False the fallback is taken per layer, nothing warns, gradients still flow
+    normally, and the ONLY symptom is ~10x the activation memory. It cost one CUDA OOM in
+    test_memory_probe_at_the_full_batch_shape; on a longer sequence bucket it would have cost
+    three hours of a run instead. `model.training` is the trap: the PEFT wrapper reports True
+    while every decoder layer under it is in eval mode straight out of `from_pretrained`.
+
+    Returns the number of checkpointable layers. Raises if there are none, or if any is in eval
+    mode -- that one is not silently fixable here, because a caller that put the backbone in
+    eval mode may have meant it.
+    """
+    from transformers.modeling_layers import GradientCheckpointingLayer
+
+    layers = [m for m in model.modules() if isinstance(m, GradientCheckpointingLayer)]
+    if not layers:
+        raise RuntimeError(
+            "no GradientCheckpointingLayer found under the backbone -- gradient checkpointing "
+            "cannot be enabled, and the §8.1 batch shape will not fit in 16 GB"
+        )
+
+    in_eval = [l for l in layers if not l.training]
+    if in_eval:
+        raise RuntimeError(
+            f"{len(in_eval)} of {len(layers)} decoder layers are in EVAL mode, so gradient "
+            f"checkpointing will not run and activations will not fit in 16 GB "
+            f"(model.training reads {model.training} -- that is the PEFT wrapper, not the "
+            f"layers). Call model.train() before training."
+        )
+
+    func = next(
+        (f for m in model.modules() if (f := getattr(m, "_gradient_checkpointing_func", None))),
+        None,
+    )
+    for layer in layers:
+        if getattr(layer, "gradient_checkpointing", False):
+            continue
+        if getattr(layer, "_gradient_checkpointing_func", None) is None:
+            if func is None:
+                raise RuntimeError(
+                    "gradient_checkpointing_enable() left no _gradient_checkpointing_func to "
+                    "copy onto the decoder layers"
+                )
+            layer._gradient_checkpointing_func = func
+        layer.gradient_checkpointing = True
+    return len(layers)
 
 
 def load_backbone_with_adapter(cfg: Config, adapter_dir):
@@ -103,7 +180,7 @@ def load_backbone_with_adapter(cfg: Config, adapter_dir):
     model = PeftModel.from_pretrained(base, str(adapter_dir), is_trainable=False)
     for p in model.parameters():
         p.requires_grad_(False)
-    return model
+    return model.eval()   # explicit: the PEFT wrapper's own `.training` defaults to True
 
 
 def trainable_parameter_names(module: torch.nn.Module) -> set[str]:

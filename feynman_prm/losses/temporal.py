@@ -6,12 +6,22 @@ of *steps remaining*, which is what makes the single global eval threshold tau m
 thing on every question -- and (5) L_step is expressed in those same units.
 
     delta[r,c] = Dist[r,c] - Next[r,c]              Next is ALWAYS detached (tmd.py:113)
-    mask       = delta > t                          t = clip_t_steps * (-log gamma)
+    mask       = delta > t                          t = log(clip_t_gain / gamma), §7.4.3
     div        = where(mask, delta, gamma*exp(where(mask, t, delta)) - Dist)
 
 Minimiser: `d/dDist [gamma*exp(Dist - Next) - Dist] = 0  =>  Dist = Next - log gamma`, i.e.
 arriving at s_i cut the distance to g by exactly one step's worth. The value at that minimum
 is `1 - Dist`, so **L_T is expected to be NEGATIVE. Watch plateau and NaN, not sign.**
+
+**The clip is the initialisation guard, and at step 0 it fires on EVERYTHING.** psi and phi
+are independently initialised, so `Dist = d(phi, psi_g)` starts at the "two unrelated 512-d
+latents" value ~11, while `Next = d(psi_s', psi_g)` is psi against *itself* on LM hidden
+states, which are strongly anisotropic (mean pairwise cosine ~0.99 on Qwen) and therefore
+collapse to ~1.3. That gap -- `delta ~ 9.8` at init -- is not noise and not a step count; it
+is pure representation offset, and the exponential branch would turn it into
+`gamma*exp(9.8) ~ 1.7e4`. `t` exists to stop exactly that. See §7.4.3 for why `t` must NOT be
+rescaled by `-log gamma`. `backup/linear_branch_fraction` starting at 1.0 and falling to ~0
+within ~100 steps as L_I closes the gap is the CORRECT trace.
 
 Two things not to "simplify":
 
@@ -46,7 +56,7 @@ def temporal_loss(
 ) -> tuple[Tensor, dict[str, float]]:
     """Returns (loss, diagnostics). `Dist` here is `Matrices.Dist_backup`."""
     gamma = cfg.discount
-    t = cfg.clip_t                       # scale-free: clip_t_steps * (-log gamma), §7.4.3
+    t = cfg.clip_t                       # log(clip_t_gain / gamma) -- bounds exp(), §7.4.3
     dw = cfg.losses.backup.diag_backup
     rho = cfg.losses.backup.goal_scope_ratio
 
@@ -74,9 +84,17 @@ def temporal_loss(
             "backup/delta_mean": float(delta.mean()),
             "backup/dist_mean": float(Dist.mean()),
             "backup/target_step_cost": cfg.neg_log_gamma,
-            # Diagnostic #15: the LINEX guard should fire RARELY. If it climbs, raise
-            # clip_t_steps -- do not change `discount` (§7.4.3).
+            # Diagnostic #15. Read it as a TRAJECTORY, not a level (§7.4.3):
+            #   step 0        ~1.0   psi/phi are independent, delta ~ 9.8 >> t. Expected.
+            #   ~100 steps    ->0    L_I has closed the gap; the exp branch takes over.
+            #   later, rising  the ruler is drifting -- look at L_I and #13 FIRST.
+            # Raising clip_t_gain in response is what produced the 8760.29 backup at init:
+            # it does not fix delta, it just uncaps exp(delta). NEVER change `discount` here.
             "backup/linear_branch_fraction": float(mask.float().mean()),
+            "backup/delta_max": float(delta.max()),
+            # What the exponential branch actually reached, against its cap `clip_t_gain`.
+            # Pinned at the cap => every term is clipped; near gamma => converged (delta ~ 0).
+            "backup/gain": float((gamma * torch.exp(delta_clipped)).max()),
             # Diagnostic #13: logged separately and ALWAYS, whatever goal_scope_ratio is.
             # Cross-question pairs ask to shrink a distance to an unreachable goal (§7.4.2);
             # if that term dominates or diverges, lower rho.

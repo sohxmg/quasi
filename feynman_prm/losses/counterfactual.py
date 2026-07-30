@@ -12,7 +12,7 @@ Why it matters more than it looks (§4.4): this dataset has almost no natural br
 MANUFACTURES the branching structure the quasimetric losses need. Nothing in TMD corresponds
 to it; it is spec-only.
 
-Only the DATA is deferred. §8.3's ~63k mined branch points are NOT a substitute (PLAN
+Only the DATA is deferred. §8.3's ~30k mined branch points are NOT a substitute (PLAN
 finding 2): L_CF needs a meaning-preserving positive, and a branch point is two
 meaning-changing continuations with a correctness label.
 """

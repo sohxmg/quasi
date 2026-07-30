@@ -30,5 +30,8 @@ include = ["feynman_prm*"]
 testpaths = ["tests"]
 markers = [
     "gpu: requires a CUDA device and the real model (deselect with -m 'not gpu')",
+    # The ONLY tests that take optimizer steps on the real backbone. Opt-in, never part of a
+    # normal GPU run: the phase-1 run measures the same quantities better and for free.
+    "ablation: loads the backbone and trains it briefly (run with -m ablation)",
 ]
 filterwarnings = ["ignore::DeprecationWarning"]

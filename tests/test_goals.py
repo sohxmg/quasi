@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 
 import numpy as np
 import torch
@@ -78,7 +79,10 @@ def test_discount_reaches_BOTH_consumers(cfg):
     at_09 = dataclasses.replace(cfg, discount=0.9)
     assert at_09.neg_log_gamma < cfg.neg_log_gamma
     assert at_09.step_margin < cfg.step_margin
+    # clip_t also falls with a larger discount, but via log(gain/gamma), NOT as a multiple of
+    # neg_log_gamma -- and by far less: 3.689 -> 3.101, where the step cost drops 6.5x (§7.4.3).
     assert at_09.clip_t < cfg.clip_t
+    assert math.isclose(at_09.backup_gain, cfg.backup_gain, rel_tol=1e-9)
 
 
 def test_goal_type_mix_is_logged(cfg):

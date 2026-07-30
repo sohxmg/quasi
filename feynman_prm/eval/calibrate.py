@@ -24,6 +24,7 @@ import numpy as np
 import torch
 
 from ..config import Config
+from ..diagnostics.logging import Progress
 from .metrics import processbench_metrics
 from ..utils.indexing import predicted_label_from_deltas
 
@@ -77,8 +78,12 @@ def score_validation(model, rows, cfg: Config, device, pad_id: int) -> tuple[lis
             states = reps.psi[offset : offset + T + 1]
             d = model.distance(states, goals[b].expand_as(states))
             deltas.append((d[1:] - d[:-1]).float().cpu().tolist())
+        progress.advance(len(pending))
         pending.clear()
 
+    # ~18k held-out sequences (2,000 val questions x 9.18): minutes of silence before
+    # ProcessBench is even touched, and tau comes out of it (§9.2).
+    progress = Progress("calibrate/val", len(rows))
     for row in rows:
         pending.append(row)
         labels.append(int(row.z) if not row.correct else -1)

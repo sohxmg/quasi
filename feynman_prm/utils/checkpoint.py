@@ -58,15 +58,45 @@ def save_checkpoint(
     return path
 
 
-def load_heads(model: torch.nn.Module, checkpoint_dir: str | Path, strict: bool = False) -> dict:
+def load_heads(
+    model: torch.nn.Module,
+    checkpoint_dir: str | Path,
+    strict: bool = False,
+    allow_missing: tuple[str, ...] = (),
+) -> dict:
+    """`allow_missing` names prefixes the checkpoint is EXPECTED not to carry, so they stay
+    at their fresh initialisation instead of aborting the load.
+
+    Exactly one caller needs it, and it is not an edge case: **phase 1 has no goal head at
+    all** (§7.7, locked #15), so `runs/phase1/*/heads.pt` legitimately holds only `psi.*` and
+    `phi.*`, while phase 2 builds the model `with_goal_head=True` and fits that head from
+    scratch. Without the exemption `train_goal_head.py` cannot load ANY phase-1 checkpoint --
+    it raises before `build_cache` runs, which reads as the script finishing in seconds.
+
+    Keep it explicit at the call site rather than exempting `goal_head.` globally. The guard's
+    real job is §14's LoRA trap -- the stock PEFT save path writes the adapter only and
+    silently drops the trained heads -- and an eval loading a PHASE-2 checkpoint must still
+    fail loudly if the goal head is absent, because there the head is trained weight.
+    """
     payload = torch.load(Path(checkpoint_dir) / "heads.pt", map_location="cpu", weights_only=False)
     missing, unexpected = model.load_state_dict(payload["heads"], strict=False)
     if strict and unexpected:
         raise RuntimeError(f"unexpected keys in heads.pt: {unexpected}")
-    head_missing = [k for k in missing if k.startswith(HEAD_PREFIXES)]
+    head_missing = [
+        k
+        for k in missing
+        if k.startswith(HEAD_PREFIXES) and not (allow_missing and k.startswith(allow_missing))
+    ]
     if head_missing:
         raise RuntimeError(f"heads.pt is missing head parameters: {head_missing[:8]}")
-    return {"step": payload.get("step"), "missing": missing, "unexpected": unexpected}
+    return {
+        "step": payload.get("step"),
+        "missing": missing,
+        "unexpected": unexpected,
+        "freshly_initialised": sorted(
+            {k.split(".")[0] for k in missing if allow_missing and k.startswith(allow_missing)}
+        ),
+    }
 
 
 def load_config_from_checkpoint(checkpoint_dir: str | Path):
