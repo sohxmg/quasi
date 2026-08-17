@@ -119,6 +119,11 @@ class RunLogger:
             # cost. `above` is the fraction of good steps over target -- read it, not the
             # mean, which stayed at +0.240 through a whole run that capped F1 at 0.456.
             ("good/above_target_fraction", "above"),
+            # §16.26's own gauge, on the console because it is the statistic (7) L_term (§7.13)
+            # exists to move and it is watched at lambda_term = 0.0 to decide whether the term
+            # is worth turning on at all. `gate/within_question_terminal_spread` is the same
+            # quantity but only runs in phase 2; this one is per step.
+            ("term/within_question_terminal_spread", "spread"),
             ("probe01/questions_in_batch", "Q"),
             ("step/distinct_z", "z"),
             # ---- phase 2 (§7.7). It logs per EPOCH, and 20 epochs is the whole curve, so

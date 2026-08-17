@@ -11,6 +11,16 @@ pandas
 pyarrow
 tqdm
 pytest
+sympy                   # feynman_prm/eval/bon.py ONLY, via CRM's vendored math grader.
+antlr4-python3-runtime==4.11.*
+                        # ALSO bon.py only, and it is NOT optional for the math subsets.
+                        # sympy's parse_latex needs it, and CRM's `symbolic_equal` swallows
+                        # the ImportError -- without this the grader quietly stops
+                        # understanding \frac{} and marks answers wrong that CRM's grader
+                        # accepted. `crm_grader.assert_grader_environment` fails the run
+                        # rather than let that reach a comparison table.
+anthropic               # scripts/generate_counterfactuals.py ONLY (the L_CF data, §7.5).
+                        # Nothing under feynman_prm/ imports it; training never calls an API.
 wandb                   # log.wandb defaults to true; RunLogger raises if it is missing.
                         # metrics.jsonl + console remain the source of truth either way.
 # NOT: trl, verl, deepspeed, vllm, flash-attn, bitsandbytes, optimum, openrlhf

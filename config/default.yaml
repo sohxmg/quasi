@@ -12,7 +12,31 @@
 # psi/phi hidden layers, and hidden_size (always read from the downloaded config.json).
 
 run:
-  name: phase1
+  # ONE DIRECTORY PER LOSS-SET CHANGE. `runs/<name>/` holds step*/ , final/ , phase2/ ,
+  # metrics.jsonl, events.jsonl and config.resolved.yaml, and train.py writes into it without
+  # asking -- so reusing a name silently overwrites the checkpoint the last set of numbers
+  # came from. `runs/phase1/` is the lambda_good=1 run whose §9.3.1 F1 0.241 / §9.7 rank
+  # tables are the current baseline; do not point a new run at it.
+  name: phase1_cf_term          # THE FIRST RUN IN WHICH (4) L_CF AND (7) L_term BOTH ENTER A
+                                # GRADIENT. 2026-08-15. lambda_cf 0.0 -> 1.0 and
+                                # lambda_term 0.0 -> 1.0.
+                                #
+                                # TWO CHANGES, AND THAT IS A KNOWN CONFOUND CHOSEN ON PURPOSE.
+                                # The human was offered the sequenced pair (phase1_cf, then
+                                # phase1_cf_term, one change each) and chose the bundle for the
+                                # faster signal. So §16.27's complaint about the 2026-08-04 run
+                                # applies to this one too and is NOT an oversight: a move in F1
+                                # or gate/recall_at_1 CANNOT be assigned to (4) or (7) from this
+                                # run alone. The two separating re-runs are in scripts/train.sh
+                                # and each is one line; budget for one of them.
+                                #
+                                # Everything else is runs/phase1_nce_temp_relu2's shipped config
+                                # -- tau_NCE = sqrt(512), L_good relu_squared,
+                                # nce_mask_nearer_same_traj = true (2026-08-04).
+                                # NOTE that run was launched with `--set losses.zeta=0.1`, which
+                                # is NOT in this file; zeta is 0.05 here, TMD-faithful. Pass the
+                                # same override or the bundle is THREE changes, not two -- do
+                                # not assume the baseline's directory matches this file.
   out_dir: runs
   seed: 42
 
@@ -57,6 +81,47 @@ data:
                                  # val_f1 numbers stay comparable across the change.
   n_val_questions: 2000
 
+  # ============ (4) L_CF's data, attached to the MAIN batch (§7.5.3 option (b)) ============
+  # CHOSEN BY THE HUMAN 2026-08-15 over §7.5.3's separate interleaved loader. `phi_i =
+  # phi(h_{i-1}, act_emb_i)` and rewriting step i leaves h_{i-1} untouched, so a CF example
+  # whose prefix is already forwarded in this batch costs an embedding lookup plus an MLP --
+  # NO LM forward. The interleaved loader pays one prefix forward per CF example instead.
+  #
+  # MEASURED 2026-08-15 (offline, no GPU): 27,114 examples over 8,639 questions, ALL inside
+  # the 34,650-question train selection, 0 in the val holdout, 0 duplicate (question,
+  # step_index) -- and 24,911 of 27,114 prefixes (91.9%) are reachable from the capped train
+  # trajectories. THAT is the level `cf/attach_rate` should sit near over an epoch; far
+  # below it means the join is broken, not that the data is thin. (The cap arithmetic alone
+  # predicts 85.6%; the extra 6.3 points are CF examples riding a SIBLING trajectory that
+  # shares the first i steps, which is why the key is the prefix and not the trajectory.)
+  #
+  # A miss is DROPPED and counted (`cf/examples_attached` vs `cf/examples_eligible`), never
+  # backfilled: a backfill is a prefix forward inside the main step, which is the cost this
+  # option exists to avoid.
+  #
+  # "" disables the path entirely and (4) stays an exact zero. NOTE the campaigns' floors
+  # differ on disk as of 2026-08-15 -- gemini was regenerated at 1/3, bharatcode and openai
+  # are still at 2/5 (§7.5.2) -- so this list mixes two validator settings.
+  #
+  # THE THREE FILES ARE LISTED, NOT GLOBBED. `data/cf/cf70k*.jsonl` matches SIXTEEN files:
+  # each campaign writes `.raw`, `.rejected`, `.discarded` and `.responses` beside the kept
+  # examples, and those have different schemas. Comma-separated; each part must match at
+  # least one file or the launch fails.
+  #
+  # THEY NOW LIVE IN `data/cf_train/`, WHICH IS A SNAPSHOT, NOT THE CAMPAIGN DIRECTORY
+  # (2026-08-15). `data/cf/` is 426 MB of campaign artifacts of which 52 MB are kept
+  # examples; the training box only ever needs the 52 MB, so the three kept files are
+  # copied into `data/cf_train/` and that is the only data directory that ships. The
+  # copies are a SNAPSHOT: a campaign that keeps generating grows `data/cf/*.jsonl` and
+  # NOT these, so re-copy (and re-rsync) before a run that is meant to see new examples.
+  # `data/cf/` is untouched -- `cf_exclude_generated.py` globs `data/cf/*responses.jsonl`
+  # and must keep finding them, or the next campaign regenerates anchors already paid for.
+  cf_glob: "data/cf_train/cf70k.jsonl,data/cf_train/cf70k_gm.jsonl,data/cf_train/cf70k_oai.jsonl"
+  cf_max_per_batch: 12           # ~9.3/batch covers 27,114 over ~2,920 micro-batches in one
+                                 # epoch; 12 leaves headroom for the uneven ones. The cap is
+                                 # what keeps L_CF's magnitude and the per-step cost flat on
+                                 # a batch that happens to hold many CF-covered questions.
+
 # ===================== THE ONE DISCOUNT (locked #9) =====================
 # Read in TWO places and it is the SAME number in both, exactly as in TMD:
 #   1. goal sampler  - datasets.py:263  how far ahead training goals are drawn
@@ -87,7 +152,42 @@ sampling:
                                  # batch_report.py before raising it.
   max_correct_per_question: 4    # CAPS, not quotas: min(cap, available). median is 2. §4.2.1
   max_incorrect_per_question: 3
-  nce_mask_same_traj: false      # locked #12 - we want the negatives
+  nce_mask_same_traj: false      # locked #12 - we want the negatives. THE BLUNT SWITCH: it
+                                 # also drops the rows EARLIER than the positive, which are
+                                 # honest hard negatives and the only within-solution gradient
+                                 # there is. Stays false; the surgical one is below.
+  nce_mask_nearer_same_traj: true   # §16.4 / §9.9.2, ON since 2026-08-04.
+                                 # Goal at s_6 with the sampled positive phi_3: rows phi_4,
+                                 # phi_5, phi_6 are on that SAME trajectory and are all NEARER
+                                 # the goal -- phi_6 lands ON it -- and cross_entropy marks
+                                 # every one of them wrong. §16.4 wrote this down on
+                                 # 2026-07-24 and it sat open for 11 days while §9.8.5
+                                 # asserted the opposite ("the backward direction is correct
+                                 # here"); that sentence is withdrawn (§9.9.2).
+                                 # Measured on the sampler: 41.8% of columns carry at least
+                                 # one, 0.64 rows per column, and they are the CLOSEST rows in
+                                 # the pool -- so their share of the softmax MASS is far above
+                                 # their 0.2% share of the count.
+                                 # It also dissolves the duplicate-column contradiction for
+                                 # free: probe01/distinct_goal_ratio has read 0.704 for 150
+                                 # logged steps, i.e. 29.6% of goal columns are byte-identical
+                                 # to another column with a DIFFERENT positive, asserting
+                                 # opposite orderings of the same pair (§9.9.3).
+                                 # Rows EARLIER than the positive are KEPT.
+                                 # PRE-FLIGHT: nce/argmax_in_nearer_set is computed on the RAW
+                                 # logits with every mask off, so it reads on this run too.
+                                 # High => the mask is aimed right. ~0 => the softmax mass is
+                                 # elsewhere and this will be inert; find out where (§9.9.6).
+                                 # JUDGE ON within_question_terminal_spread and
+                                 # probe02/delta_good_mean (now -0.32, target -0.693), not F1.
+  nce_mask_sibling_correct_late: false  # §16.25(a)/§9.9.5, the OTHER half of the false
+                                 # negatives: late states of a SIBLING CORRECT trajectory
+                                 # against TERMINAL goal columns. Left OFF deliberately --
+                                 # §9.9.7's order of work runs the nearer mask FIRST and
+                                 # judges it alone, and this run already carries two other
+                                 # changes (tau_NCE and relu_squared).
+  nce_mask_same_question_correct: false # the blunt comparator for the line above (~15 of
+                                 # ~347). Over-broad by §16.25(a)'s own admission.
   group_by_length: true          # ~60% -> ~10% padding, est. 4h -> 2h/epoch. Peak mem 9->12 GB,
                                  # so the longest batch runs FIRST as a probe. false = spec order.
                                  # Q stays ~12.9 and every §8.1.1 count holds either way (PLAN 4a).
@@ -96,7 +196,34 @@ losses:
   lambda_nce: 1.0                # (1) L_NCE   §7.2
   lambda_i: 1.0                  # (2) L_I     §7.3  TMD puts invariance at 1.0, NOT under zeta
   zeta: 0.05                     # (3) L_T     §7.4  weights the BACKUP ONLY - tmd.py:124
-  lambda_cf: 0.0                 # (4) L_CF    §7.5  data deferred (§2 #4)
+  lambda_cf: 1.0                 # (4) L_CF    §7.5  RAISED FROM 0.0 ON 2026-08-15. Locked #4's
+                                 # two gates are both cleared: 27,114 examples are on disk
+                                 # (§7.5.2) and the main-batch attach path is wired (§7.5.13),
+                                 # so this is the last line that was holding (4) inert.
+                                 # 1.0 because that is what EVERY other spec term in the set
+                                 # carries (lambda_nce, lambda_i, lambda_step, lambda_good) and
+                                 # there is nothing to prefer over parity: NOTHING ABOUT THIS
+                                 # WEIGHT IS MEASURED and §17 has no row for it. Same standing
+                                 # as §16.8's "every loss weight is unvalidated" -- it is a
+                                 # starting point, not a result.
+                                 # tau STAYS 1.0 on (4) and is a plain function argument, not a
+                                 # config key (§7.5.13): sqrt(512) has provenance for (1) only,
+                                 # and at tau = 22.6 the ~8-candidate denominator is flat enough
+                                 # that the weight is an off switch. tau and lambda are the same
+                                 # knob here (gradient ~ lambda/tau), so moving both in one
+                                 # change would bundle two effects -- which is what §9.10 is on
+                                 # record for having cost.
+                                 # THIS IS THE ONLY LOSS-SET CHANGE IN THIS RUN. Read it against
+                                 # runs/phase1_nce_temp_relu2 and nothing else.
+                                 # --set losses.lambda_cf=0.0 is the one-line revert; the term
+                                 # is then skipped in total.py and the total is bit-identical to
+                                 # the previous run's, with the full cf/* key set still logged.
+                                 # WATCH cf/attach_rate -- it must sit near 0.916 over the epoch
+                                 # (§7.5.13). Far below means the join is broken, and the most
+                                 # likely cause is a sequences.parquet written before
+                                 # 2026-08-15: no prefix_hash column -> every state hashes to 0
+                                 # -> nothing attaches -> lambda_cf > 0 trains NOTHING while
+                                 # every other log line looks healthy. Re-run prepare_data.py.
   lambda_step: 1.0               # (5) L_step  §7.6  carries correctness. not optional (§7.6.2)
   lambda_good: 1.0               # (6) L_good  §7.12 THE FALSE-POSITIVE TERM. ON since
                                  # 2026-07-28 - the §16.21 sign-off, given by the human after
@@ -120,8 +247,118 @@ losses:
                                  # still logs its diagnostics.
                                  # A loss-set change invalidates the checkpoint: train FRESH,
                                  # never resume step750.
-  nce_temperature: 1.0           # tmd.py:92 uses sqrt(512)=22.6; we diverge (bug B10a, §7.2).
-                                 # float, not a boolean - raise it if logit_std blows up
+  lambda_term: 1.0               # (7) L_term  §7.13 / §16.26. THE "PULL TWO CORRECT TERMINALS
+                                 # OF ONE QUESTION TOGETHER" TERM.
+                                 # RAISED 0.0 -> 1.0 ON 2026-08-15 BY THE HUMAN, who was shown
+                                 # §16.26's order of work and §7.13.1's shortcut and asked for
+                                 # it on anyway. That is the decision; what follows is what it
+                                 # obliges the run to do, NOT an argument against it.
+                                 # It is (4) L_CF's loss re-grouped by QUESTION instead of by
+                                 # CF example - same function, no fork, no mode flag - so
+                                 # §7.5.1's two REQUIREMENT properties hold unchanged.
+                                 # ZERO EXTRA LM FORWARDS - traj_qid / traj_correct /
+                                 # traj_terminal are already in every batch (§7.13). The cost
+                                 # is a ~50x7 distance against Dist's ~348x172.
+                                 # 1.0 for the same reason lambda_cf is: parity with every
+                                 # other spec term, and NOTHING about it is measured (§16.8).
+                                 #
+                                 # WHAT §16.26 SAYS AND WHY IT IS NOT A BLOCKER. Its order of
+                                 # work puts the §9.9 NCE masks first because they are free and
+                                 # unambiguously correct. nce_mask_nearer_same_traj IS already
+                                 # on (2026-08-04) -- but §9.10.3 records that tau_NCE = sqrt(512)
+                                 # mutes L_NCE 22.6x and mutes that repair with it, so the mask
+                                 # has NOT had its clean test. Turning (7) on before that test
+                                 # is a deliberate reordering, not a completed prerequisite.
+                                 #
+                                 # THE RUN MUST SEPARATE TWO EXPLANATIONS (§7.13.1, §16.26).
+                                 # Every correct solution of a question prints the same answer
+                                 # and incorrect siblings essentially never do (answer_match_auc
+                                 # 0.927 against a chance of 0.500; n = 0.001), so (7) can be
+                                 # solved by clustering on the final NUMBER -- which transfers to
+                                 # nothing, because a PRM scores UNFINISHED solutions. So a run
+                                 # that improves gate/recall_at_1 has TWO explanations and the
+                                 # improvement alone does not choose between them. The separator
+                                 # is post-hoc and costs no training time:
+                                 #   python scripts/goal_gate.py --checkpoint runs/<run>/final
+                                 #   python scripts/goal_gate.py --checkpoint runs/<run>/final \
+                                 #          --mask-answer
+                                 # Recall that survives masking is structure; recall that
+                                 # collapses under it was the printed string. REPORT BOTH.
+                                 # THE TERM IS A HYPOTHESIS, NOT A FIX -- an unseparated
+                                 # improvement does not promote it to one.
+                                 #
+                                 # Computed and logged at every weight, like lambda_good, so
+                                 # --set losses.lambda_term=0.0 is an exact revert that still
+                                 # logs every term/* diagnostic.
+                                 # WATCH term/loss against term/chance, which is NOT a constant
+                                 # (it moves with the batch's ragged caps), and
+                                 # term/within_question_terminal_spread, which is the statistic
+                                 # §16.26 says this term exists to move: 2.905 at the §9.8.3
+                                 # measurement, and it should FALL.
+                                 # term/questions_skipped_single_correct is ~31% of questions by
+                                 # construction (10,899 of 34,650 have <2 correct, §7.13) -- that
+                                 # is the level to read it against, NOT zero.
+  lambda_term_temperature: 1.0   # (7)'s tau. §7.13 requires whoever raises lambda_term to PICK
+                                 # this in the same change rather than inherit an unexamined
+                                 # default, so it is a config key as of 2026-08-15 instead of a
+                                 # function argument nobody had to look at.
+                                 # 1.0, and the arithmetic is the §7.5.13 argument on a SMALLER
+                                 # denominator. (7)'s softmax has c_q - 1 + w_q candidates,
+                                 # which is ~4.9 at the §8.1 caps (mean 2.66 correct, 2.24
+                                 # incorrect) against (4)'s ~8. §9.10.1 measured distance-space
+                                 # spread at 0.31 -> 0.76; at tau = sqrt(512) that is a logit
+                                 # spread of ~0.034 over ~5 candidates, i.e. a flat softmax
+                                 # pinned at log(c-1+w). sqrt(512) is not a temperature here, it
+                                 # is an off switch, and it has provenance for (1) ONLY.
+                                 # tau and lambda are the same knob (gradient ~ lambda/tau), so
+                                 # whoever moves this is moving lambda_term by the reciprocal.
+  lambda_cf_temperature: 0.1     # (4)'s tau. A CONFIG KEY as of 2026-08-18, and before that
+                                 # it was not a key OR an argument: total.py called
+                                 # counterfactual_loss with no temperature= at all, so the
+                                 # 2026-08-15 run raised lambda_cf 0.0 -> 1.0 against an
+                                 # INHERITED 1.0 default -- exactly the "a default nobody has
+                                 # to type is what unexamined means" failure §7.13 wrote the
+                                 # rule for. The comment above lambda_cf claiming "tau STAYS
+                                 # 1.0 on (4) and is a plain function argument" described an
+                                 # argument that was never passed; it is withdrawn.
+                                 #
+                                 # 0.1, NOT 1.0, and the arithmetic is §7.5.14's. (4) operates
+                                 # at a DISTANCE SPREAD of ~0.06 -- measured at step ~1090 of
+                                 # wc5byua1: cf/positive_distance 0.056 against
+                                 # cf/negative_distance 0.119. At tau = 1.0 that is a logit
+                                 # spread of 0.06 over a ~9-candidate softmax, i.e. FLAT to
+                                 # three decimals, and cf/loss - log(P+N) flatlined at -0.02
+                                 # for the whole run. tau = 0.1 puts p_pos ~ 0.5-0.65 across
+                                 # the plausible spread range 0.06-0.25. 0.05 was rejected: it
+                                 # saturates (p_pos -> 1, loss -> -log(1) territory) if the
+                                 # separation keeps growing, and a saturated softmax has no
+                                 # gradient left.
+                                 # THE TELL IS cf/loss - cf/chance, never raw cf/loss. If it
+                                 # runs to -1.09 or beyond, tau overshot and 0.2 is the
+                                 # fallback; if it stays near -0.02, this change did nothing.
+                                 # tau and lambda are the same knob (gradient ~ lambda/tau), so
+                                 # whoever moves this is moving lambda_cf by the reciprocal.
+  nce_temperature: 22.627417     # sqrt(latent_dim) = sqrt(512). **TMD's own scaling**
+                                 # (tmd.py:92: `logits = -dist / sqrt(phi.shape[-1])`),
+                                 # adopted 2026-08-04. Reverses §7.2's documented divergence,
+                                 # which shipped 1.0 for every run to date.
+                                 # WHAT IT DOES: distances of O(1-10) become logits of
+                                 # O(0.05-0.5), so the softmax is much flatter and L_NCE's
+                                 # gradient on the distances is 22.6x smaller. That is a
+                                 # REWEIGHTING of (1) against (2)/(3)/(5)/(6) as much as it is
+                                 # a temperature.
+                                 # THE RISK, and it is written down in §7.2/§14: a flat softmax
+                                 # is also the signature of bug B10a. B10a itself cannot
+                                 # recur -- distances are fp32 (§6.3), so the logit
+                                 # DIFFERENCES do not round to equal -- but the diagnostic
+                                 # that catches it now reads 22.6x smaller.
+                                 # SO READ logit_std x temperature, NOT logit_std: the
+                                 # scale-free quantity is the spread in DISTANCE space.
+                                 # tests/test_gpu.py's B10a guard was made scale-aware for
+                                 # exactly this (the B12 lesson: never a constant offset on a
+                                 # quantity whose scale is set elsewhere).
+                                 # If nce/loss now sits pinned at log(R) with pos ~= neg,
+                                 # this is why -- revert to 1.0, do not raise lambda_nce.
   action_invariance:
     mode: diagonal               # diagonal (TMD, tmd.py:100-105) | grid_within_question | grid_batch
                                  # the grid modes exist only to reproduce §16.3's failure and they
@@ -144,7 +381,7 @@ losses:
                                  # AWAY from the goal per step and CONVERGES CLEANLY - no
                                  # curve would show it. config.py rejects margin_steps <= 0
                                  # so the negation happens in exactly one place.
-    form: relu                   # relu | softplus.  USE RELU.
+    form: relu_squared           # relu | relu_squared | softplus.  NEVER SOFTPLUS.
                                  # Delta >= -0.693 is a hard floor implied by L_I + L_T, so
                                  # pushing past it costs one of them. softplus applies half
                                  # its gradient AT the target and never reaches zero:
@@ -153,6 +390,26 @@ losses:
                                  #   relu      P(D>tau) 0.000  ruler 1.222  -B -0.95  D -0.834
                                  # SIMULATED ON FREE LATENTS (§7.12), same seed and data.
                                  # softplus overshoots the ruler by 2.2 steps and breaks L_T.
+                                 #
+                                 # relu_squared SHIPPED 2026-08-04, and it is a response to a
+                                 # MEASURED failure of relu on the model. `mean relu(Delta-c)`
+                                 # is indifferent between many small violations and one large
+                                 # one, so the bulk moved and the tail did not:
+                                 #   Delta mean          +0.392 -> -0.412   (the sign flip)
+                                 #   frac_above_natural   0.070 ->  0.16    REGRESSED
+                                 #   p99                   0.86 ->  2.43
+                                 #   good/delta_max                 7.58
+                                 # (§7.12's mid-run block, run jjkad2ae.) The square makes the
+                                 # gradient 2*excess instead of 1, so a violator is priced by
+                                 # how far out it is; it keeps relu's two load-bearing
+                                 # properties -- exactly 0 below c, exactly 0 gradient AT c.
+                                 # NOT MEASURED at this form anywhere: there is no
+                                 # relu_squared row in §7.12's table, on the model or in
+                                 # simulation. Judge it on probe14's frac_above_natural and
+                                 # p99, and watch invariance/residual_diagonal HARDER than at
+                                 # relu -- L_good's cost lands on L_I, and this form can put
+                                 # ~68 on a single term where relu put 8.3.
+                                 # --set losses.good_loss.form=relu is the one-line revert.
     include_incorrect_prefix: true   # also train i <= z of INCORRECT trajectories - they are
                                  # on-track states and eval scores them the same way. i = z+1
                                  # is L_step's pair and is excluded either way; so is i > z+1,
@@ -221,9 +478,30 @@ train:
 
 goal_head:                       # ================= PHASE 2 (§7.7) =================
   lr: 1.0e-3
-  epochs: 20
+  epochs: 100                    # RAISED from 20 on 2026-08-04. The 20-epoch fit on
+                                 # runs/phase1 ended with goal/loss 7.469 -> 4.491 and STILL
+                                 # FALLING, so 20 was a stopping point nobody chose. 186
+                                 # batches/epoch at 95,078 terminals and the whole fit took
+                                 # ~53 s of the 4,554 s wall clock -- the cache is the cost,
+                                 # not the epochs, so 100 is ~4 min and --from-cache makes a
+                                 # refit seconds.
+                                 # PICK THIS ON goal/val_loss, NOT goal/loss. phase2/val_best
+                                 # prints where val bottomed; if it is far below epochs-1,
+                                 # lower this key rather than banking the overfit.
+                                 # AND SEE §9.7.3 BEFORE SPENDING TIME HERE: the gold
+                                 # reference terminal moved localisation by 0.2 sigma against
+                                 # the goal head, and a CROSS-QUESTION goal retained 103% of
+                                 # the signal (§9.8.1). A better goal head has a measured
+                                 # near-zero expected effect on F1. This is a cheap
+                                 # correctness fix, not a lever.
   batch_size: 512
   max_terminals_per_question: 8
+  val_questions: 2000            # HELD OUT BY QUESTION, added 2026-08-04. Holding out one of
+                                 # a question's terminals while training on its siblings leaks
+                                 # h_s0 -- eval queries unseen QUESTIONS, so the split has to
+                                 # be the same kind. Costs ~6% of the training terminals and
+                                 # is a slice on a cached tensor. 0 disables it, and then
+                                 # `epochs` has no honest number to be chosen on.
 
 eval:
   subsets: [gsm8k, math, olympiadbench, omnimath]

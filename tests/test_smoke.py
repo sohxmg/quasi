@@ -118,10 +118,11 @@ def test_zeta_weights_the_backup_only(cfg):
         + cfg.losses.lambda_cf * out.terms["cf"]
         + cfg.losses.lambda_step * out.terms["step"]
         + cfg.losses.lambda_good * out.terms["good"]      # §7.12, 0.0 by default
+        + cfg.losses.lambda_term * out.terms["term"]      # §7.13, 0.0 by default
     )
     assert torch.allclose(out.total, manual, atol=1e-6)
-    # ...and the sum is over the WHOLE terms dict, so a seventh term cannot slip in unweighted
-    assert set(out.terms) == {"nce", "invariance", "backup", "cf", "step", "good"}
+    # ...and the sum is over the WHOLE terms dict, so an eighth term cannot slip in unweighted
+    assert set(out.terms) == {"nce", "invariance", "backup", "cf", "step", "good", "term"}
 
 
 def test_cf_is_inert_at_lambda_zero(cfg):
@@ -130,3 +131,22 @@ def test_cf_is_inert_at_lambda_zero(cfg):
     out = _run(cfg)[-1]
     assert float(out.terms["cf"]) == 0.0
     assert float(out.info["cf/loss"]) == 0.0
+
+
+def test_term_is_computed_at_every_weight(cfg):
+    """(7) L_term is computed on every batch at EVERY `lambda_term`, and that is the property
+    worth pinning -- not the weight, which moved 0.0 -> 1.0 on 2026-08-15.
+
+    It is not a structural zero like (4) L_CF was: `term/within_question_terminal_spread` is
+    §16.26's own gauge and is worth plotting whether or not the term is being trained, so the
+    term computes even when its weight does not use it. The bit-identity at weight zero is
+    `tests/test_terminal_class.py`'s job."""
+    import dataclasses
+
+    for lam in (0.0, cfg.losses.lambda_term):
+        c = dataclasses.replace(cfg, losses=dataclasses.replace(cfg.losses, lambda_term=lam))
+        out = _run(c)[-1]
+        assert float(out.terms["term"]) > 0.0, (
+            f"at lambda_term={lam} the term is absent, not inert -- it must compute regardless"
+        )
+        assert out.info["term/questions"] > 0.0

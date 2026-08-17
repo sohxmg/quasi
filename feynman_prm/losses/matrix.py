@@ -49,6 +49,8 @@ class Matrices:
     D_term: Tensor          # (S, T_c) with grad
     D_term_good: Tensor     # (S, T_c) -- D_term itself unless good_loss.detach_goal (§7.12)
     pos_row: Tensor         # (C,) the source row that sampled goal column c
+    goal_step: Tensor       # (C,) i of s_i within its trajectory -- L_NCE's nearer-set (§9.9.2)
+    goal_is_terminal: Tensor # (C,) bool: the goal is its trajectory's ending (§9.9.5)
     SQ: Tensor              # (R, C) bool: same-question
     terminal_states: Tensor # (T_c,) state index of each correct terminal
     terminal_traj: Tensor   # (T_c,) trajectory index of each correct terminal
@@ -112,6 +114,8 @@ def build_matrices(
         D_term=D_term,
         D_term_good=D_term_good,
         pos_row=goals.pos_row,
+        goal_step=goals.goal_step,
+        goal_is_terminal=goals.is_terminal,
         SQ=same_question_mask(batch, goals),
         terminal_states=terminal_states,
         terminal_traj=terminal_traj,

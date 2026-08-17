@@ -71,6 +71,7 @@ def score_samples(
     cfg: Config,
     device,
     goal_fn: Optional[Callable[[Tensor, Sequence[Sample]], Tensor]] = None,
+    state_score_fn: Optional[Callable[[Tensor], Tensor]] = None,
     label: str = "processbench",
 ) -> tuple[list[list[float]], dict[str, float]]:
     """Returns (per-sample Delta lists, counters). An over-length sample gets an empty Delta
@@ -78,7 +79,15 @@ def score_samples(
 
     `goal_fn(h_s0, batch_samples) -> (B, D)` overrides the goal head; the skyline passes the
     reference-solution terminal that way (§9.5).
+
+    `state_score_fn(states) -> (T,)` takes `psi_0 .. psi_T` and returns a per-step score
+    DIRECTLY, with no goal of any kind -- §9.4's goal-free scores. It is mutually exclusive
+    with `goal_fn` and it bypasses the goal head entirely, which is the point: it measures how
+    much of the localisation signal survives with the goal argument removed rather than
+    replaced (§9.7.7). Nothing it produces is a reported result.
     """
+    if goal_fn is not None and state_score_fn is not None:
+        raise ValueError("goal_fn and state_score_fn are mutually exclusive")
     sep_id = sep_token_id(tokenizer, cfg.data.sep_token)
     pad_id = tokenizer.pad_token_id
     counters = {"over_length": 0, "scored": 0}
@@ -92,6 +101,18 @@ def score_samples(
         idxs = [i for i, _ in pending]
         batch = collate([r for _, r in pending], pad_id=pad_id).to(device)
         reps = model(batch)
+        if state_score_fn is not None:
+            for b, sample_idx in enumerate(idxs):
+                T = int(batch.traj_T[b])
+                offset = int(batch.traj_state_offset[b])
+                states = reps.psi[offset : offset + T + 1]                  # (T+1, D)
+                scores = state_score_fn(states)                             # (T,)
+                assert scores.shape == (T,), f"state_score_fn returned {tuple(scores.shape)}"
+                deltas[sample_idx] = scores.float().cpu().tolist()
+                counters["scored"] += 1
+            progress.advance(len(pending))
+            pending.clear()
+            return
         if goal_fn is None:
             if model.goal_head is None:
                 raise RuntimeError(
@@ -149,8 +170,10 @@ def score_samples(
     return deltas, counters
 
 
-def predict(deltas: Sequence[Sequence[float]], tau: float) -> list[int]:
-    return [predicted_label_from_deltas(d, tau) for d in deltas]
+def predict(
+    deltas: Sequence[Sequence[float]], tau: float, rule: str = "first_crossing"
+) -> list[int]:
+    return [predicted_label_from_deltas(d, tau, rule) for d in deltas]
 
 
 def evaluate_subset(
@@ -158,8 +181,9 @@ def evaluate_subset(
     samples: Sequence[Sample],
     tau: float,
     leaked: Optional[Sequence[bool]] = None,
+    rule: str = "first_crossing",
 ) -> dict:
-    predictions = predict(deltas, tau)
+    predictions = predict(deltas, tau, rule)
     labels = [s.label for s in samples]
     result = {"tau": tau, **processbench_metrics(predictions, labels)}
     if leaked is not None:
@@ -167,11 +191,35 @@ def evaluate_subset(
     return result
 
 
+def pack_deltas(deltas: Sequence[Sequence[float]]) -> tuple[np.ndarray, np.ndarray]:
+    """Ragged Delta lists -> (flat, lengths), so they survive in an npz without pickle.
+
+    An over-length sample has length 0 and unpacks back to an empty list, which predicts -1.
+    """
+    lengths = np.asarray([len(d) for d in deltas], dtype=np.int64)
+    parts = [np.asarray(d, dtype=np.float32) for d in deltas if len(d)]
+    flat = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+    return flat, lengths
+
+
+def unpack_deltas(flat: np.ndarray, lengths: np.ndarray) -> list[list[float]]:
+    out, i = [], 0
+    for n in lengths.tolist():
+        out.append(flat[i : i + n].tolist())
+        i += n
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     """The reported eval (§9.3): one scoring path, the quasimetric Delta-d with the goal head.
 
     There is no second scoring head to report against (locked #3a). The skyline runs on the
     1,400 joinable samples and is LABELLED as a skyline (§9.5).
+
+    The raw Delta arrays are written alongside `processbench.json` as `deltas.npz`. Scoring
+    is the only expensive part of this file and every threshold question -- the null baseline,
+    detection vs localisation, the per-subset tau sweep, the length-bucket check -- is a pure
+    function of those arrays. Discarding them turns each of those into another GPU run.
     """
     import argparse
     import json
@@ -221,14 +269,28 @@ def main(argv: list[str] | None = None) -> int:
     leak_path = Path(cfg.data.dir) / "processbench_math_leak.json"
     leak_map = json.loads(leak_path.read_text()) if leak_path.exists() else {}
 
+    raw: dict[str, np.ndarray] = {"tau": np.asarray(tau, dtype=np.float64)}
+
     for subset in cfg.eval.subsets:
         samples = load_processbench(subset)
         deltas, counters = score_samples(model, tokenizer, samples, cfg, device, label=subset)
         assert_truncation_budget(counters, len(samples), subset)
         leaked = [bool(leak_map.get(s.id, False)) for s in samples] if subset == "math" else None
-        results[subset] = evaluate_subset(deltas, samples, tau, leaked=leaked)
+        results[subset] = evaluate_subset(
+            deltas, samples, tau, leaked=leaked, rule=cfg.eval.localisation_rule
+        )
         results[subset]["counters"] = counters
         print(f"{subset}: {json.dumps(results[subset], default=float)}", flush=True)
+
+        flat, lengths = pack_deltas(deltas)
+        raw[f"{subset}/flat"] = flat
+        raw[f"{subset}/lengths"] = lengths
+        raw[f"{subset}/labels"] = np.asarray([s.label for s in samples], dtype=np.int64)
+        raw[f"{subset}/final_answer_correct"] = np.asarray(
+            [s.final_answer_correct for s in samples], dtype=bool
+        )
+        if leaked is not None:
+            raw[f"{subset}/leaked"] = np.asarray(leaked, dtype=bool)
 
         if cfg.eval.skyline and subset in ("gsm8k", "omnimath", "math"):
             references = load_reference_solutions(subset)
@@ -239,15 +301,27 @@ def main(argv: list[str] | None = None) -> int:
                     goal_fn=goal_fn, label=f"{subset}-skyline",
                 )
                 results[f"{subset}_SKYLINE_not_a_result"] = {
-                    **evaluate_subset(sky_deltas, samples, tau),
+                    **evaluate_subset(
+                        sky_deltas, samples, tau, rule=cfg.eval.localisation_rule
+                    ),
                     "joinable": joinable_count(samples, references),
                     "note": "SKYLINE (§9.5). The gold answer alone solves half the metric "
                             "exactly (§5.1), so this is never a reported result.",
                 }
+                sky_flat, sky_lengths = pack_deltas(sky_deltas)
+                raw[f"{subset}-skyline/flat"] = sky_flat
+                raw[f"{subset}-skyline/lengths"] = sky_lengths
+                raw[f"{subset}-skyline/labels"] = np.asarray(
+                    [s.label for s in samples], dtype=np.int64
+                )
 
     out_path = Path(args.out) if args.out else ckpt / "processbench.json"
     out_path.write_text(json.dumps(results, indent=2, default=float))
     print(f"wrote {out_path}", flush=True)
+
+    npz_path = out_path.with_name("deltas.npz")
+    np.savez_compressed(npz_path, **raw)
+    print(f"wrote {npz_path}", flush=True)
     return 0
 
 

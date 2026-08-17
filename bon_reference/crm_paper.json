@@ -1,0 +1,45 @@
+{
+  "_README": [
+    "CRM's PUBLISHED Best-of-N accuracies, transcribed by hand. Nothing here is measured by",
+    "this repo and nothing here may be recomputed by it -- that is the entire point: these are",
+    "the paper's numbers, ours come out of scripts/eval_bon.sh, and scripts/report_bon.py puts",
+    "them side by side.",
+    "",
+    "FILL THIS IN before quoting any comparison. Every value below is null, and report_bon.py",
+    "prints our column alone (with a warning) until they are real numbers.",
+    "",
+    "Units: PERCENT, 0-100, matching what crm_grader returns (eval_utils.py multiplies by 100).",
+    "If the paper reports fractions, convert here, not in the report script.",
+    "",
+    "Keys under each file are METHOD NAMES exactly as the paper labels them. Add or remove",
+    "rows freely -- report_bon.py renders whatever is here. Keep 'CRM' if the paper's own",
+    "method is in the table; that is the row the comparison is actually about.",
+    "",
+    "'baseline_first_candidate' is the no-reward-model number (accuracy of the first sampled",
+    "response). IT IS THE MOST IMPORTANT ENTRY IN THIS FILE. It does not depend on any reward",
+    "model, so if the paper reports it and our harness does not reproduce it to within sampling",
+    "noise, the candidate pool or the grader differ and NOTHING else in the table is comparable.",
+    "Fill it in even if you fill in nothing else."
+  ],
+  "source": "FILL ME: paper title, arXiv id, table number, and which column was read",
+  "transcribed_on": "FILL ME: YYYY-MM-DD",
+  "units": "percent",
+  "files": {
+    "gsm8k-plus-metamath-mistral-128": {
+      "baseline_first_candidate": null,
+      "CRM": {"best_of_8": null, "best_of_16": null, "best_of_32": null, "best_of_64": null, "best_of_128": null}
+    },
+    "math-metamath-mistral-128": {
+      "baseline_first_candidate": null,
+      "CRM": {"best_of_8": null, "best_of_16": null, "best_of_32": null, "best_of_64": null, "best_of_128": null}
+    },
+    "gsm8k-plus-muggle-128": {
+      "baseline_first_candidate": null,
+      "CRM": {"best_of_8": null, "best_of_16": null, "best_of_32": null, "best_of_64": null, "best_of_128": null}
+    },
+    "math-muggle-128": {
+      "baseline_first_candidate": null,
+      "CRM": {"best_of_8": null, "best_of_16": null, "best_of_32": null, "best_of_64": null, "best_of_128": null}
+    }
+  }
+}

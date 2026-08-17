@@ -6,4 +6,39 @@ __pycache__/
 .pytest_cache/
 runs/
 data/processed/
+# The counterfactual campaign: ~450 MB at 70k anchors in --no-thinking mode and ~2.4 GB with
+# thinking, almost all of it .responses.jsonl. Regenerable in principle and ruinously
+# expensive in practice, so it is a local artifact, never a commit. Added 2026-08-09 -- it
+# was NOT ignored before, and `data/processed/` above does not cover it.
+data/cf/
+# The 52 MB the TRAINING box actually needs: the three kept-example files of `data/cf/`,
+# snapshot-copied out of the campaign directory so `cf_glob` points at something small and
+# shippable (§7.5.13).
+#
+# **THE THREE KEPT FILES ARE NOW COMMITTED (2026-08-18), REVERSING THE 2026-08-15 RULE ABOVE
+# THEM.** That rule said they "move to the GPU box by rsync, not by git", by analogy with
+# `data/cf/`. The analogy does not hold and the sizes are the whole reason: `data/cf/` is
+# 426 MB dominated by `.responses.jsonl`, while this snapshot is 52 MB of jsonl that git
+# stores zlib-compressed at **8.9 MB** -- against GitHub's 100 MB per-file hard block and a
+# `.git` that was 1.6 MB. Renting a cloud GPU makes the difference concrete: `git clone`
+# either produces a box that can train or it does not, and an out-of-band 52 MB rsync is one
+# more thing to get wrong at 2am on a metered card.
+#
+# It is line-oriented text, so successive corpus snapshots DELTA rather than duplicating --
+# which is why the raw `.jsonl` is committed and not a `.gz` (gzip output is incompressible
+# and deltas at ~100%). Re-snapshotting after a campaign grows costs single-digit MB.
+#
+# THE EXCLUSION IS STILL `data/cf_train/*`, WITH FOUR NEGATIONS, AND THAT IS DELIBERATE.
+# Every campaign writes `.raw`, `.rejected`, `.discarded` and `.responses` beside its kept
+# examples under the SAME `cf70k*` prefix (§7.5.13 -- the reason `cf_glob` is a comma-separated
+# list and not a glob), and those have different schemas and are ~8x the size. A stray copy
+# landing in here must stay ignored. Note the exclusion cannot be `data/cf_train/` with a
+# trailing slash: git cannot re-include a file whose parent DIRECTORY is excluded, so the
+# pattern has to name the contents.
+data/cf_train/*
+!data/cf_train/cf70k.jsonl
+!data/cf_train/cf70k_gm.jsonl
+!data/cf_train/cf70k_oai.jsonl
+!data/cf_train/MANIFEST.md
 wandb/
+secret.txt

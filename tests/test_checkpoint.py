@@ -118,3 +118,74 @@ def test_run_logger_writes_jsonl(tmp_path):
     assert records[0]["step"] == 1 and records[0]["nce/loss"] == 5.85
     assert "optimizer_steps" in (tmp_path / "run" / "events.jsonl").read_text()
     assert "L=+1.5000" in RunLogger.format_console(1, {"loss/total": 1.5})
+
+
+def test_launching_into_an_occupied_run_dir_aborts_before_the_gpu(tmp_path, monkeypatch):
+    """`run.name` is one directory per loss-set change (§7.12: a loss-set change invalidates
+    the checkpoint, so nothing here is resumable). The accident this guards is launching with
+    the PREVIOUS name still in the yaml -- which silently overwrites the checkpoint the last
+    reported numbers came from, and leaves no symptom: `runs/<name>/final` simply answers to
+    different weights than the numbers quoted against it.
+
+    It must fire BEFORE the data load and before wandb, i.e. on a repo with no parquet at all,
+    which is what this test is standing in for."""
+    from feynman_prm.train import main
+
+    occupied = tmp_path / "runs" / "taken"
+    (occupied / "final").mkdir(parents=True)
+    (occupied / "final" / "heads.pt").write_text("not-really-a-checkpoint")
+
+    overrides = ["--set", f"run.out_dir={tmp_path / 'runs'}", "--set", "run.name=taken",
+                 "--set", "log.wandb=false"]
+    with pytest.raises(SystemExit, match="already holds checkpoint"):
+        main(overrides)
+
+    # A directory that exists but holds no checkpoint is NOT a collision: that is every
+    # relaunch after a crash, and after `config.resolved.yaml` has already been written.
+    # `data.dir` points at nothing on purpose -- the run must die on the missing parquet and
+    # NOT go on to build a 1.5B model, which is what it would do on the training box where
+    # the real parquet exists.
+    (tmp_path / "runs" / "fresh").mkdir()
+    (tmp_path / "runs" / "fresh" / "config.resolved.yaml").write_text("{}\n")
+    with pytest.raises(FileNotFoundError):          # got past the guard, died on the parquet
+        main(overrides_for(tmp_path, "fresh"))
+
+
+def overrides_for(tmp_path, name, *extra):
+    return ["--set", f"run.out_dir={tmp_path / 'runs'}", "--set", f"run.name={name}",
+            "--set", f"data.dir={tmp_path / 'no-such-data'}", "--set", "log.wandb=false",
+            *extra]
+
+
+def test_a_probe_writes_to_its_own_directory_and_never_blocks_the_real_run(tmp_path):
+    """**The workflow this guard broke on its first day (2026-08-04).** `--max-steps 20` runs
+    the identical code path and ends with the identical `save_checkpoint(.../final)`, so the
+    documented sequence -- probe, read the four launch blocks, then launch for real -- left a
+    20-step `final/` sitting exactly where the real run wanted to write, and the real run was
+    refused. A guard that fires on the intended workflow is B11/B12 again.
+
+    A probe is disposable by construction, so it is suffixed rather than exempted: its
+    checkpoint stays inspectable, its wandb run stops sharing a name with the real one, and
+    the collision cannot happen in either direction. Re-probing is routine and never blocked.
+    """
+    from feynman_prm.train import main
+
+    occupied = tmp_path / "runs" / "taken"
+    (occupied / "final").mkdir(parents=True)
+    (occupied / "final" / "heads.pt").write_text("not-really-a-checkpoint")
+    # ...and a previous probe's checkpoint, which must also not block a re-probe.
+    (tmp_path / "runs" / "taken_probe" / "final").mkdir(parents=True)
+    (tmp_path / "runs" / "taken_probe" / "final" / "heads.pt").write_text("x")
+
+    # the full run is still refused -- the guard has not been weakened
+    with pytest.raises(SystemExit, match="already holds checkpoint"):
+        main(overrides_for(tmp_path, "taken"))
+
+    # ...but the probe goes through, twice, over its own occupied directory
+    for _ in range(2):
+        with pytest.raises(FileNotFoundError):
+            main(overrides_for(tmp_path, "taken", "--max-steps", "20"))
+
+    # and --overwrite is still the explicit escape for the real run
+    with pytest.raises(FileNotFoundError):
+        main(overrides_for(tmp_path, "taken", "--overwrite"))

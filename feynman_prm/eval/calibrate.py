@@ -107,7 +107,10 @@ def calibrate_tau(
 
     curve = []
     for tau in grid:
-        preds = [predicted_label_from_deltas(d, float(tau)) for d in deltas]
+        preds = [
+            predicted_label_from_deltas(d, float(tau), cfg.eval.localisation_rule)
+            for d in deltas
+        ]
         metrics = processbench_metrics(preds, labels)
         curve.append({"tau": float(tau), **metrics})
 

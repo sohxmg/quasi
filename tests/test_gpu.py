@@ -34,6 +34,7 @@ from feynman_prm.config import load_config                                  # no
 from feynman_prm.data.collate import SequenceRow, collate                   # noqa: E402
 from feynman_prm.data.goals import sample_goals                             # noqa: E402
 from feynman_prm.data.tokenize import build_sequence, sep_token_id          # noqa: E402
+from feynman_prm.losses.good import good_bounds                             # noqa: E402
 from feynman_prm.losses.matrix import build_matrices                        # noqa: E402
 from feynman_prm.losses.total import expected_init_values, phase1_loss      # noqa: E402
 from feynman_prm.model.backbone import (                                    # noqa: E402
@@ -330,9 +331,17 @@ def test_bf16_backbone_with_fp32_heads_and_fp32_distances(gpu_cfg, model, tokeni
     assert model.head_dtype == torch.float32
     assert reps.psi.dtype == torch.float32
     assert matrices.Dist.dtype == torch.float32
-    print(f"\nlogit_std {out.info['nce/logit_std']:.5f}  "
+    # **SCALE-FREE, and it has to be.** `logit_std` is `dist_std / tau_NCE`, so the shipped
+    # tau = sqrt(512) = 22.63 (§7.2, adopted 2026-08-04) divides this diagnostic by 22.63
+    # while the geometry it is diagnosing is unchanged. A constant 1e-3 floor on a quantity
+    # whose scale is set by a config key is exactly bug B12 -- express it as a ratio to that
+    # scale instead. What B10a actually breaks is the DISTANCE spread, so test that.
+    tau = gpu_cfg.losses.nce_temperature
+    dist_std = out.info["nce/logit_std"] * tau
+    print(f"\nlogit_std {out.info['nce/logit_std']:.5f}  x tau {tau:.3f} -> "
+          f"dist_std {dist_std:.5f}  "
           f"pos {out.info['nce/logits_pos']:.4f}  neg {out.info['nce/logits_neg']:.4f}")
-    assert out.info["nce/logit_std"] > 1e-3, "bug B10a: the fp32 cast is not effective at runtime"
+    assert dist_std > 1e-3, "bug B10a: the fp32 cast is not effective at runtime"
     model.zero_grad(set_to_none=True)
 
 
@@ -518,14 +527,26 @@ def test_initialisation_values_hit_section_18(gpu_cfg, model, tokenizer):
         "indexing (§7.6)"
     )
     assert 0.0 < out.info["step/z_zero_fraction"] < 1.0, "the fixture lost its mixed z"
-    assert set(out.terms) == {"nce", "invariance", "backup", "cf", "step", "good"}, (
+    assert set(out.terms) == {"nce", "invariance", "backup", "cf", "step", "good", "term"}, (
         "the loss set changed -- there is no L_BT, no L_CRM and no L_correct (§7.9); `good` "
-        "is (6) L_good and it arrived 2026-07-28 (§7.12)"
+        "is (6) L_good and it arrived 2026-07-28 (§7.12); `term` is (7) L_term and it arrived "
+        "2026-08-08 at lambda_term = 0.0 (§7.13)"
     )
     assert float(out.terms["cf"]) == 0.0, "lambda_cf is 0 until the data exists"
 
-    # (6) L_good's sandwich, which runs OPPOSITE to L_step's because relu is INCREASING in
-    # Delta. `expected["good"]` is nan on purpose: there is no level to predict (§7.12).
+    # (7) L_term ships at 0.0 but is COMPUTED, so it must be a real number sitting near its own
+    # chance level on an untrained model -- `term/chance` is batch-dependent, not a constant.
+    assert gpu_cfg.losses.lambda_term == 0.0, "lambda_term ships at zero (§7.13, §16.26)"
+    assert float(out.terms["term"]) > 0.0, "L_term is inert, not absent -- it must compute"
+    print(f"  term         loss {float(out.terms['term']):.4f}  "
+          f"chance {out.info['term/chance']:.4f}  "
+          f"questions {out.info['term/questions']:.0f}  "
+          f"skipped {out.info['term/questions_skipped_single_correct']:.0f}  "
+          f"within_question_terminal_spread "
+          f"{out.info['term/within_question_terminal_spread']:.4f}")
+
+    # (6) L_good's sandwich, which runs OPPOSITE to L_step's because every form is INCREASING
+    # in Delta. `expected["good"]` is nan on purpose: no level to predict (§7.12).
     c = out.info["good/margin"]
     assert c < 0.0, "c is NEGATIVE -- the wrong sign trains good steps AWAY from the goal"
     assert c == pytest.approx(gpu_cfg.good_margin, rel=1e-6)
@@ -533,14 +554,17 @@ def test_initialisation_values_hit_section_18(gpu_cfg, model, tokenizer):
         "no good transition found. Every correct trajectory's own terminal is excluded, so a "
         "fixture with one correct solution per question measures nothing here."
     )
-    lo = max(out.info["good/delta_min"] - c, 0.0)
-    hi = max(out.info["good/delta_max"] - c, 0.0)
+    # Through `good_bounds`, i.e. in the CONFIGURED form -- the same call train.py's launch
+    # guard makes. A relu-shaped bound here would fail a correct relu_squared run, which is
+    # the B11/B12 failure mode (a guard that fires on healthy training).
+    lo, hi = good_bounds(out.info["good/delta_min"], out.info["good/delta_max"], gpu_cfg)
     print(f"  good delta   mean {out.info['good/delta_mean']:+.4f}  "
           f"[{out.info['good/delta_min']:+.4f}, {out.info['good/delta_max']:+.4f}]  "
           f"c {c:+.4f}  above target {out.info['good/above_target_fraction']:.3f}  "
-          f"terms {out.info['good/terms']:.0f}")
+          f"terms {out.info['good/terms']:.0f}  form {gpu_cfg.losses.good_loss.form}")
     assert lo - 1e-4 <= float(out.terms["good"]) <= hi + 1e-4, (
-        "L_good is not the relu of its own logged delta -- check the sign of c first (§7.12)"
+        f"L_good is not the {gpu_cfg.losses.good_loss.form} of its own logged delta -- check "
+        "the sign of c first (§7.12)"
     )
     assert math.isnan(expected["good"]), "no init level is predicted for L_good, by decision"
     model.zero_grad(set_to_none=True)

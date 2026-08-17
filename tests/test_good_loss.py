@@ -4,7 +4,12 @@ L_good is the mirror image of L_step and almost every property is reversed, whic
 gets its own file rather than a few cases bolted onto test_step_loss.py:
 
     L_step   -log sigma(Delta_{z+1} - m)    m > 0    decreasing in Delta    ONE pair per traj
-    L_good   relu(Delta_i - c)              c < 0    increasing in Delta    every good i
+    L_good   f(Delta_i - c)                 c < 0    increasing in Delta    every good i
+
+`f` is `losses.good_loss.form`: `relu`, `relu_squared` (SHIPPED since 2026-08-04) or
+`softplus`. Anything asserting a LEVEL must therefore go through `good_penalty` or
+`good_bounds` rather than a literal -- a hardcoded `relu` bound is how a correct run gets
+aborted by its own launch guard (B11/B12).
 
 **The sign of `c` is the test that matters most here.** `c = +0.693` trains good steps one
 full step AWAY from the goal per step, converges perfectly cleanly, and shows up on no curve
@@ -21,7 +26,7 @@ import torch
 
 from feynman_prm.data.collate import collate, state_index_of
 from feynman_prm.data.goals import correct_terminal_columns
-from feynman_prm.losses.good import good_loss
+from feynman_prm.losses.good import good_bounds, good_loss, good_penalty
 from feynman_prm.losses.matrix import step_deltas
 from conftest import synthetic_row
 
@@ -129,8 +134,12 @@ def test_the_wrong_sign_still_trains_and_that_is_why_this_file_exists(cfg):
     loss, _ = good_loss(D_term, batch, terminal_traj, cfg)
     loss.backward()
 
-    # Every Delta is 0 here, so every relu is active and the loss is exactly relu(0 - c).
-    assert float(loss) == pytest.approx(0.69315, rel=1e-4)
+    # Every Delta is 0 here, so every term is active and the loss is exactly f(0 - c) in the
+    # configured form -- 0.69315 at `relu`, its square at `relu_squared`. Written through
+    # `good_penalty` rather than as a literal so this stays a test of the SIGN, which is the
+    # point of the file, and not a second place the shipped form has to be edited.
+    expected = float(good_penalty(torch.tensor([-cfg.good_margin]), cfg.losses.good_loss.form))
+    assert float(loss) == pytest.approx(expected, rel=1e-4)
     # Gradient on d(psi_i, g) is POSITIVE and on d(psi_{i-1}, g) NEGATIVE: descending this
     # term shrinks the distance across the step, i.e. makes it progress. Under c = +0.693 the
     # loss and its gradient have the IDENTICAL shape -- only the point where relu switches off
@@ -244,41 +253,41 @@ def test_masked_not_crashed_when_no_goal_exists(cfg):
 
 
 # ======================================================================================
-# the form: relu vs softplus (§7.12's ablation)
+# the form: relu / relu_squared vs softplus (§7.12's ablation)
 # ======================================================================================
 
+HINGES = ("relu", "relu_squared")        # the two that switch off at c. softplus does not.
 
-def test_relu_is_exactly_zero_below_c_and_never_above_softplus(cfg):
+
+@pytest.mark.parametrize("form", HINGES)
+def test_the_hinges_are_exactly_zero_below_c_and_softplus_is_not(cfg, form):
     """`Delta >= c` is a hard floor implied by L_I + L_T, so pushing past it costs one of
-    them. relu STOPS at c; softplus applies half its gradient AT c and never reaches zero."""
+    them. Both relu forms STOP at c; softplus applies half its gradient AT c and never
+    reaches zero. That is the property softplus is rejected on, and it is why `relu_squared`
+    is a change of TAIL PRICING and not a return to softplus' overshoot."""
     batch, terminal_traj, _ = _fixture([T, T, T], [T, T])
     c = cfg.good_margin
 
-    # every Delta a full unit below c: relu is exactly 0, softplus is not
+    # every Delta a full unit below c: both hinges are exactly 0, softplus is not
     below = _ramp(batch, terminal_traj, c - 1.0)
-    relu_loss = good_loss(below, batch, terminal_traj, cfg)[0]
+    hinge_loss = good_loss(below, batch, terminal_traj, _variant(cfg, form=form))[0]
     soft_loss = good_loss(below, batch, terminal_traj, _variant(cfg, form="softplus"))[0]
-    assert float(relu_loss) == 0.0
+    assert float(hinge_loss) == 0.0
     assert float(soft_loss) > 0.0
 
-    torch.manual_seed(0)
-    for _ in range(5):
-        D_term = _dterm(batch, terminal_traj) * 3.0
-        r = float(good_loss(D_term, batch, terminal_traj, cfg)[0])
-        s = float(good_loss(D_term, batch, terminal_traj, _variant(cfg, form="softplus"))[0])
-        assert r <= s + 1e-6, "relu <= softplus pointwise, so also in the mean"
 
-
-def test_relu_gradient_vanishes_at_and_below_the_target(cfg):
+@pytest.mark.parametrize("form", HINGES)
+def test_hinge_gradient_vanishes_at_and_below_the_target(cfg, form):
     """The ablation's whole argument: softplus' gradient is 0.5 AT the target and never hits
-    0, so it overshoots to Delta = -1.556 and breaks L_T's ruler. relu stops."""
+    0, so it overshoots to Delta = -1.556 and breaks L_T's ruler. Both hinges stop --
+    relu_squared's gradient is `2 * excess`, which is 0 at excess = 0 just as relu's is."""
     batch, terminal_traj, _ = _fixture([T, T, T], [T, T])
     # Delta_i = d_i - d_{i-1} = c exactly for every i
     at_target = _ramp(batch, terminal_traj, cfg.good_margin, grad=True)
 
-    relu_l = good_loss(at_target, batch, terminal_traj, cfg)[0]
-    relu_l.backward()
-    assert float(at_target.grad.abs().max()) == 0.0, "relu applies NO pressure at the target"
+    hinge_l = good_loss(at_target, batch, terminal_traj, _variant(cfg, form=form))[0]
+    hinge_l.backward()
+    assert float(at_target.grad.abs().max()) == 0.0, f"{form} applies NO pressure at target"
 
     at_target.grad = None
     soft_l = good_loss(at_target, batch, terminal_traj, _variant(cfg, form="softplus"))[0]
@@ -286,17 +295,62 @@ def test_relu_gradient_vanishes_at_and_below_the_target(cfg):
     assert float(at_target.grad.abs().max()) > 0.0, "softplus keeps pushing past the target"
 
 
-def test_matches_a_reference_implementation(cfg):
+def test_relu_squared_prices_the_tail_against_the_bulk(cfg):
+    """**The reason the shipped form changed on 2026-08-04, as a property rather than a
+    number.** `mean relu(Delta - c)` is a mean of a LINEAR hinge, so it is indifferent
+    between one violator at 4x and four at 1x -- and mid-run that is what happened: the bulk
+    fell to a mean of -0.412 while p99 climbed to 2.43 and delta_max hit 7.58 (§7.12).
+
+    Under relu the two batches below cost the SAME; under relu_squared the concentrated one
+    costs 4x more, because the gradient on a violator is proportional to how far out it is.
+    """
+    batch, terminal_traj, _ = _fixture([T, T, T, T, T], [T, T])
+    c = cfg.good_margin
+    n = int((step_deltas(_dterm(batch, terminal_traj), batch, terminal_traj)
+             .good(True)).sum())
+    assert n >= 4, "need enough good terms for the spread/concentrated split to differ"
+
+    spread = _ramp(batch, terminal_traj, c + 1.0)            # every Delta 1.0 over target
+    delta = torch.zeros(batch.n_states)
+    delta[1:] = c                                            # everything at target...
+    delta[batch.row_dst[0]] = c + float(n)                   # ...but one violator at n
+    concentrated = torch.cumsum(delta, 0)[:, None].expand(
+        batch.n_states, int(terminal_traj.numel())
+    ).contiguous()
+
+    relu_cfg, sq_cfg = _variant(cfg, form="relu"), _variant(cfg, form="relu_squared")
+    r_spread = float(good_loss(spread, batch, terminal_traj, relu_cfg)[0])
+    r_conc = float(good_loss(concentrated, batch, terminal_traj, relu_cfg)[0])
+    s_spread = float(good_loss(spread, batch, terminal_traj, sq_cfg)[0])
+    s_conc = float(good_loss(concentrated, batch, terminal_traj, sq_cfg)[0])
+
+    # relu: same total excess -> same loss. The tail is invisible to it.
+    assert r_conc == pytest.approx(r_spread, rel=1e-5)
+    # relu_squared: the SAME total excess concentrated in one term costs n times more.
+    assert s_conc == pytest.approx(s_spread * n, rel=1e-5)
+    assert s_conc > s_spread
+
+
+@pytest.mark.parametrize("form", ("relu", "relu_squared", "softplus"))
+def test_matches_a_reference_implementation(cfg, form):
     batch, terminal_traj, _ = _fixture([T, T, T], [T, T], [T, T, F, F])
     torch.manual_seed(0)
     D_term = _dterm(batch, terminal_traj)
+    variant = _variant(cfg, form=form)
 
     sd = step_deltas(D_term, batch, terminal_traj)
     selected = sd.delta[sd.good_correct | sd.good_incorrect]
-    reference = torch.clamp(selected - cfg.good_margin, min=0.0).mean()
+    hinge = torch.clamp(selected - cfg.good_margin, min=0.0)
+    reference = {
+        "relu": hinge,
+        "relu_squared": hinge ** 2,
+        "softplus": torch.nn.functional.softplus(selected - cfg.good_margin),
+    }[form].mean()
 
-    loss, info = good_loss(D_term, batch, terminal_traj, cfg)
+    loss, info = good_loss(D_term, batch, terminal_traj, variant)
     assert torch.allclose(loss, reference, atol=1e-7)
+    # The DIAGNOSTICS are form-independent: they are statistics of Delta, not of the loss,
+    # so probe14 and good/* read the same quantity whichever form is training.
     assert info["good/terms"] == float(selected.numel())
     assert info["good/delta_mean"] == pytest.approx(float(selected.mean()), abs=1e-7)
     assert info["good/above_target_fraction"] == pytest.approx(
@@ -304,24 +358,49 @@ def test_matches_a_reference_implementation(cfg):
     )
 
 
-def test_the_sandwich_runs_opposite_to_l_steps(cfg):
-    """relu is INCREASING in Delta, so relu(delta_min - c) <= L_good <= relu(delta_max - c).
+@pytest.mark.parametrize("form", ("relu", "relu_squared", "softplus"))
+def test_the_sandwich_runs_opposite_to_l_steps(cfg, form):
+    """Every form is INCREASING in Delta, so f(delta_min - c) <= L_good <= f(delta_max - c).
     The lower bound is legitimately 0 whenever every good step already sits at or below
-    target -- that is a converged term, not a dead one (§18)."""
+    target -- that is a converged term, not a dead one (§18).
+
+    Asserted through `good_bounds`, which is what train.py's launch guard calls: a
+    relu-shaped bound would abort a correct relu_squared run, and a guard that fires on
+    healthy training is B11/B12 all over again."""
     batch, terminal_traj, _ = _fixture([T, T, T, T], [T, T], [T, T, F, F])
+    variant = _variant(cfg, form=form)
     torch.manual_seed(1)
     for scale in (0.1, 1.0, 5.0):
         D_term = _dterm(batch, terminal_traj) * scale
-        loss, info = good_loss(D_term, batch, terminal_traj, cfg)
-        lo = max(info["good/delta_min"] - cfg.good_margin, 0.0)
-        hi = max(info["good/delta_max"] - cfg.good_margin, 0.0)
+        loss, info = good_loss(D_term, batch, terminal_traj, variant)
+        lo, hi = good_bounds(info["good/delta_min"], info["good/delta_max"], variant)
         assert lo - 1e-6 <= float(loss) <= hi + 1e-6
 
-    # ...and the degenerate end of that bound is reachable and correct.
+    # ...and the degenerate end of that bound is reachable and correct for the two hinges.
     below = _ramp(batch, terminal_traj, cfg.good_margin - 1.0)
-    loss, info = good_loss(below, batch, terminal_traj, cfg)
-    assert float(loss) == 0.0
-    assert max(info["good/delta_min"] - cfg.good_margin, 0.0) == 0.0
+    loss, info = good_loss(below, batch, terminal_traj, variant)
+    lo, _ = good_bounds(info["good/delta_min"], info["good/delta_max"], variant)
+    if form in HINGES:
+        assert float(loss) == 0.0
+        assert lo == 0.0
+    else:
+        assert float(loss) > 0.0
+
+
+def test_a_relu_bound_would_reject_a_correct_relu_squared_run(cfg):
+    """Pins the reason `good_bounds` exists rather than a literal in train.py. With any
+    violator more than one unit past c, relu_squared's loss is ABOVE the relu upper bound --
+    so the pre-2026-08-04 launch assert would have killed this run at step 1."""
+    batch, terminal_traj, _ = _fixture([T, T, T], [T, T])
+    sq = _variant(cfg, form="relu_squared")
+    far = _ramp(batch, terminal_traj, cfg.good_margin + 3.0)     # every Delta 3.0 over target
+
+    loss, info = good_loss(far, batch, terminal_traj, sq)
+    relu_hi = max(info["good/delta_max"] - cfg.good_margin, 0.0)
+    assert float(loss) > relu_hi, "the old hardcoded bound is violated -- that is the point"
+
+    lo, hi = good_bounds(info["good/delta_min"], info["good/delta_max"], sq)
+    assert lo - 1e-6 <= float(loss) <= hi + 1e-6
 
 
 # ======================================================================================
@@ -505,7 +584,11 @@ def test_the_shipped_default_is_lambda_good_one(cfg):
     silent one: at 0.0 everything still runs, every curve still looks healthy, and the only
     symptom is the F1 ceiling at the end of the run."""
     assert cfg.losses.lambda_good == 1.0
-    assert cfg.losses.good_loss.form == "relu"
+    # relu_squared since 2026-08-04 (§7.12's mid-run block: relu moved the bulk and lost the
+    # tail). Pinned for the same reason lambda_good is -- the shipped form is a decision, and
+    # a silent revert to `relu` would look identical in every curve except probe14's p99.
+    # NEVER softplus: it applies gradient AT the target and stretches L_T's ruler.
+    assert cfg.losses.good_loss.form == "relu_squared"
     assert cfg.good_margin < 0.0
 
 

@@ -66,6 +66,30 @@ def test_delta_to_predicted_label(deltas, tau, expected):
     assert predicted_label_from_deltas(deltas, tau) == expected
 
 
+def test_the_two_localisation_rules_flag_identically_and_localise_differently():
+    """§9.9.1. §9.6.1's prose says `argmax`; the shipped rule -- and every reported number --
+    is `first_crossing`. **Flagging is identical**: `max Delta > tau` iff some Delta > tau, so
+    `acc_correct` cannot move between the rules. Only the index differs, so the whole trade
+    lives in `P(exact | flagged)`.
+
+    The default must stay `first_crossing`: the ProcessBench table in §9.9.1 is fit on
+    ProcessBench and §9.2 forbids choosing on it.
+    """
+    deltas = [2.0, -0.7, 5.0, -0.7]
+    assert predicted_label_from_deltas(deltas, 0.347) == 0                      # first
+    assert predicted_label_from_deltas(deltas, 0.347, "argmax") == 2            # biggest
+
+    for d in ([-0.7, -0.7], [], [0.1]):
+        assert (
+            predicted_label_from_deltas(d, 0.347)
+            == predicted_label_from_deltas(d, 0.347, "argmax")
+            == -1
+        ), "the two rules must agree on whether to flag at all"
+
+    with pytest.raises(ValueError):
+        predicted_label_from_deltas(deltas, 0.347, "biggest")
+
+
 def test_training_target_round_trips_to_the_right_prediction():
     """The round trip that makes the off-by-one fatal (§15).
 

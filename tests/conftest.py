@@ -45,6 +45,14 @@ class DummyTokenizer:
             ids.append(self._vocab[token])
         return {"input_ids": ids}
 
+    def decode(self, ids) -> str:
+        """Round-trips exactly under `__call__`: the split is on whitespace with "\\n" as its
+        own token, so joining with a single space re-tokenises to the same ids. Added for
+        `scripts/goal_gate.py --mask-answer`, which recovers a row's text from the parquet's
+        token ids rather than re-joining against the HF dataset."""
+        back = {i: t for t, i in self._vocab.items()}
+        return " ".join(back[int(i)] for i in ids)
+
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True) -> str:
         return "<|im_start|> " + messages[0]["content"] + " <|im_end|>"
 

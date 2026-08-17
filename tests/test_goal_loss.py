@@ -250,3 +250,51 @@ def test_pred_variance_is_logged_for_probe_6():
     constant = torch.zeros(4, 512)
     _, info = goal_loss(constant, torch.randn(4, 512), torch.arange(4), dist)
     assert info["goal/pred_variance"] == 0.0
+
+
+def test_phase2_val_split_is_by_question_not_by_terminal(cfg, tmp_path):
+    """Added 2026-08-04 with `goal_head.val_questions`.
+
+    The whole point of the held-out set is to say whether raising `epochs` is learning or
+    memorising, and it can only say that if the split is the same KIND of generalisation eval
+    asks for. Holding out one of a question's terminals while training on its siblings leaks
+    `h_s0` -- the head sees that exact question's input during training and the val number
+    becomes optimistic for a reason no eval will reproduce.
+
+    So: no question may contribute terminals to both sides, and the two sides must partition
+    the cache exactly (a dropped terminal would silently shrink training).
+    """
+    import dataclasses
+
+    from feynman_prm.diagnostics.logging import RunLogger
+    from feynman_prm.model.wrapper import FeynmanPRM
+    from feynman_prm.train_goal_head import fit_goal_head
+
+    tiny = dataclasses.replace(
+        cfg,
+        heads=dataclasses.replace(cfg.heads, latent_dim=32, hidden_dims=(16,)),
+        goal_head=dataclasses.replace(cfg.goal_head, epochs=2, batch_size=16, val_questions=7),
+    )
+    n_q, n_t = 20, 120
+    model = FeynmanPRM(tiny, 32, backbone=None, with_goal_head=True)
+    terminal_question = torch.randint(0, n_q, (n_t,))
+    cache = (torch.randn(n_q, 32), torch.randn(n_t, 32), terminal_question, list(range(n_q)))
+
+    events: list[tuple[str, dict]] = []
+    logger = RunLogger(tmp_path, "split")
+    logger.event = lambda name, payload: events.append((name, payload))  # type: ignore[method-assign]
+    fit_goal_head(model, cache, tiny, torch.device("cpu"), logger)
+
+    sched = next(p for n, p in events if n == "phase2/schedule")
+    assert sched["terminals_train"] + sched["terminals_val"] == n_t, "the split lost terminals"
+    assert sched["terminals_val"] > 0, "fixture must actually hold something out"
+
+    # Reproduce the split the same way the fitter does and assert the question sets are
+    # disjoint. This is the assertion that fails if anyone ever "simplifies" it to a
+    # randperm over terminals.
+    g = torch.Generator(device="cpu").manual_seed(tiny.run.seed)
+    val_q = set(torch.randperm(n_q, generator=g)[: tiny.goal_head.val_questions].tolist())
+    val_rows = torch.tensor([int(q) in val_q for q in terminal_question.tolist()])
+    assert int(val_rows.sum()) == sched["terminals_val"]
+    train_qs = set(terminal_question[~val_rows].tolist())
+    assert train_qs.isdisjoint(val_q), "a question contributed terminals to both sides"

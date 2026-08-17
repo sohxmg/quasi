@@ -54,13 +54,36 @@ def trajectory_is_correct(labels: Sequence[bool]) -> bool:
     return bool(len(labels) > 0 and all(labels))
 
 
-def predicted_label_from_deltas(deltas: Sequence[float], tau: float) -> int:
+def predicted_label_from_deltas(
+    deltas: Sequence[float], tau: float, rule: str = "first_crossing"
+) -> int:
     """§9.1 steps 5-6. `deltas[j]` is Delta_{j+1}, i.e. the cost of steps[j].
 
-    Returns the 0-based index of the first step whose Delta exceeds tau, or -1 if none
-    does. Because Delta_i is the cost of steps[i-1], the first i with Delta_i > tau maps to
-    predicted_label = i - 1 -- which, with `deltas` 0-based over i = 1..T, is just j.
+    `first_crossing` (**the default, and the shipped/reported rule**): the 0-based index of the
+    first step whose Delta exceeds tau, or -1 if none does. Because Delta_i is the cost of
+    steps[i-1], the first i with Delta_i > tau maps to predicted_label = i - 1 -- which, with
+    `deltas` 0-based over i = 1..T, is just j.
+
+    `argmax`: flag on `max Delta > tau` -- **identical flagging**, since a max exceeds tau iff
+    some element does -- then return `argmax Delta` instead of the first crossing.
+
+    **§9.6.1 describes `argmax` and every number in §9.6/§9.3.1 is `first_crossing`** (§9.9.1).
+    Measured on `runs/phase1/phase2/final/deltas.npz` at the reported tau = 1.1685, argmax is
+    worth +0.017 mean F1 -- but it LOSES 0.048 on gsm8k and wins on the other three, so it is
+    a genuine per-subset trade and not a free win.
+
+    **The default does not move, and choosing on the table in §9.9.1 would violate §9.2**: that
+    table is fit on ProcessBench, which is exactly what §9.2 forbids. Pick the rule on
+    Math-Shepherd val (`calibrate.py`) alongside tau, then set `eval.localisation_rule`.
     """
+    if rule == "argmax":
+        best, arg = None, -1
+        for j, delta in enumerate(deltas):
+            if delta > tau and (best is None or delta > best):
+                best, arg = delta, j
+        return arg
+    if rule != "first_crossing":
+        raise ValueError(f"unknown localisation rule {rule!r}")
     for j, delta in enumerate(deltas):
         if delta > tau:
             return j

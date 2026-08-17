@@ -191,33 +191,66 @@ def write_sequences_parquet(rows: Sequence[dict], path: str | Path) -> None:
     """
     import pandas as pd
 
+    from .sequence_cache import cache_path_for, columns_from_rows, save_columns
+
+    rows = list(rows)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(list(rows)).to_parquet(path, index=False)
+    pd.DataFrame(rows).to_parquet(path, index=False)
+    # The numpy cache every reader actually loads (§14 B15). Written here from the rows we
+    # already hold, so the common path never pays a read-back and a fresh parquet is never
+    # one launch away from a conversion. It is keyed on the parquet's size and mtime, so it
+    # must be written AFTER the parquet, not before.
+    save_columns(columns_from_rows(rows), cache_path_for(path), path)
 
 
 def read_sequences_parquet(path: str | Path, split: str | None = None) -> list:
-    """Returns a list of `data.collate.SequenceRow`."""
+    """Returns a list of `data.collate.SequenceRow`.
+
+    **The parquet is NOT read in this process** -- `sequence_cache` converts it once in a
+    child interpreter that has no torch in it, and this reads flat numpy arrays (§14 B15).
+    `FEYNMAN_SEQUENCE_CACHE=0` restores the direct pandas read.
+    """
     import numpy as np
-    import pandas as pd
 
     from .collate import SequenceRow
+    from .sequence_cache import load_sequence_columns
 
-    frame = pd.read_parquet(path)
+    columns = load_sequence_columns(path)
+    n_rows = len(columns["qid"])
+
+    keep = np.arange(n_rows)
     if split is not None:
-        frame = frame[frame["split"] == split]
+        if "split" not in columns:
+            raise KeyError(f"{path} carries no `split` column; cannot select split={split!r}")
+        keep = keep[columns["split"] == split]
+
+    # Absent on a parquet written before 2026-08-15. `cf_attach` counts rows with no hash and
+    # attaches nothing to them, so an old file trains exactly as it did before instead of
+    # failing at the first micro-batch.
+    has_prefix_hash = "prefix_hash__offsets" in columns
+
+    def span(name: str, i: int, dtype) -> np.ndarray:
+        # `np.array`, not `np.asarray`: every row owns its own buffer, as it did when each one
+        # came out of `np.asarray(record.input_ids, ...)`. A view would leave rows aliasing one
+        # flat array, so an in-place edit anywhere would silently reach into its neighbours.
+        offsets = columns[f"{name}__offsets"]
+        return np.array(columns[f"{name}__values"][offsets[i]:offsets[i + 1]], dtype=dtype)
+
     out = []
-    for record in frame.itertuples(index=False):
+    for i in keep:
+        i = int(i)
         out.append(
             SequenceRow(
-                qid=record.qid,
-                input_ids=np.asarray(record.input_ids, dtype=np.int64),
-                state_pos=np.asarray(record.state_pos, dtype=np.int64),
-                span_start=np.asarray(record.span_start, dtype=np.int64),
-                span_end=np.asarray(record.span_end, dtype=np.int64),
-                correct=bool(record.correct),
-                z=int(record.z),
-                recovery=bool(record.recovery),
+                qid=str(columns["qid"][i]),
+                input_ids=span("input_ids", i, np.int64),
+                state_pos=span("state_pos", i, np.int64),
+                span_start=span("span_start", i, np.int64),
+                span_end=span("span_end", i, np.int64),
+                correct=bool(columns["correct"][i]),
+                z=int(columns["z"][i]),
+                recovery=bool(columns["recovery"][i]),
+                prefix_hash=span("prefix_hash", i, np.int64) if has_prefix_hash else None,
             )
         )
     return out

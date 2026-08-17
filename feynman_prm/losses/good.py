@@ -28,7 +28,7 @@ structural on a free-latent probe -- `L_I` at 0.0024 and the positive tail still
     incorrect trajectories   i == z+1         EXCLUDED   -- (5) L_step's pair, opposite sign
     incorrect trajectories   i >  z+1         EXCLUDED   -- no loss defines Delta there
 
-**relu, not softplus, and this is not a style preference.** `Delta >= -0.693` is a hard floor
+**Not softplus, and this is not a style preference.** `Delta >= -0.693` is a hard floor
 implied by `L_I` + `L_T`, so pushing below `c` costs one of those two terms. `softplus` still
 applies half its gradient AT the target and never reaches zero, so it keeps pushing:
 
@@ -38,12 +38,38 @@ applies half its gradient AT the target and never reaches zero, so it keeps push
     relu            0.000       1.222   -0.95    -0.834     clean
 
 (SIMULATED ON FREE LATENTS -- see §7.12. Same seed and data across the three rows, but not
-measured on the model.) `relu` stops at `c`; that is the whole point of choosing it.
+measured on the model.) Both `relu` forms stop dead at `c`; softplus does not.
 
-**This is the one place in the loss set where the sandwich runs the other way.** `relu` is
-INCREASING in Delta, so `relu(delta_min - c) <= L_good <= relu(delta_max - c)`, and the lower
-bound is legitimately 0 whenever every good step already sits at or below target. Do not
-predict a level for it at init (§18).
+**`relu_squared` is the SHIPPED form as of 2026-08-04, and it is a response to a measured
+failure of `relu`.** Mid-run on `jjkad2ae` the linear hinge moved the BULK and lost the TAIL:
+good-step `Delta` mean swung +0.392 -> -0.412 (the sign flip this term exists to produce)
+while `frac_above_natural` bottomed at 0.070 near step 200 and then REGRESSED to ~0.16, `p99`
+went 0.86 -> 2.43 and `good/delta_max` reached 7.58 -- the spread tripled (§7.12's mid-run
+block). That is the signature of a hinge applied to a MEAN: `mean relu(Delta - c)` is
+indifferent between many small violations and one large one, so a shrinking bulk buys the
+loss down while a fattening tail contributes only linearly and diffusely.
+
+    relu          d/dDelta = 1        for every violator, however far out
+    relu_squared  d/dDelta = 2*excess proportional to how far out it is
+
+So `relu_squared` prices the tail against the bulk instead of trading one for the other, and
+it keeps the two properties `relu` was chosen for: exactly zero below `c`, and **exactly zero
+gradient AT `c`** (softplus' is 0.5 there, which is what overshoots the ruler). Being quadratic
+it is also the one form whose scale is not in Delta-units -- a violator at 7.58 contributes
+~68 where relu gives 8.3 -- so `invariance/residual_diagonal` is the guard to watch even harder
+than at `relu` (§7.12: L_good's cost lands on L_I, not on L_T).
+
+**NOT MEASURED at this form.** §7.12's ablation table above is relu-vs-softplus on free
+latents; there is no `relu_squared` row anywhere, on the model or in simulation. §9.7.8 filed
+it as "a well-aimed fix for a real pathology" and in the same breath noted that the good-step
+tail sits in §9.6.2's SMALL headroom column (+0.038 mean F1 against localisation's +0.281),
+so the honest expectation is a better-behaved tail, not a better F1. Judge it on
+`probe14/delta_good_of_correct/{frac_above_natural, p99}` and `invariance/residual_diagonal`.
+
+**This is the one place in the loss set where the sandwich runs the other way.** Every form
+here is INCREASING in Delta, so `f(delta_min - c) <= L_good <= f(delta_max - c)` in whichever
+`f` is configured, and the lower bound is legitimately 0 whenever every good step already sits
+at or below target. Do not predict a level for it at init (§18).
 """
 
 from __future__ import annotations
@@ -55,6 +81,37 @@ from torch import Tensor
 from ..config import Config
 from ..data.collate import Batch
 from .matrix import step_deltas
+
+
+def good_penalty(excess: Tensor, form: str) -> Tensor:
+    """`f(Delta - c)`, the per-term shaping. THE one definition of the form (§7.12).
+
+    `train.py`'s launch sandwich and the GPU probe read it through `good_bounds` below, so a
+    new form cannot be added to the loss and leave a `relu`-shaped assert behind to fire on a
+    correct run -- which is the B11/B12 failure mode: a guard that trips on healthy training.
+    """
+    if form == "relu":
+        return F.relu(excess)
+    if form == "relu_squared":
+        # Squared hinge. Gradient 2*excess: zero at and below the target exactly as `relu`,
+        # but PROPORTIONAL to the violation above it, so a Delta at +7.58 is not priced the
+        # same as one at +0.01. That asymmetry is the whole point (see the module docstring).
+        return F.relu(excess).square()
+    return F.softplus(excess)
+
+
+def good_bounds(delta_min: float, delta_max: float, cfg: Config) -> tuple[float, float]:
+    """The §18 sandwich `f(delta_min - c) <= L_good <= f(delta_max - c)`, in the SAME `f`.
+
+    Every form here is increasing in Delta, so this is exact up to fp rounding on the mean --
+    the mirror of L_step's, which is decreasing. **A lower bound of exactly 0 is legitimate**
+    and means every good step already sits at or below target: a converged term, not a dead
+    one (§7.12, §18).
+    """
+    c = cfg.good_margin
+    form = cfg.losses.good_loss.form
+    ends = good_penalty(torch.tensor([delta_min - c, delta_max - c]), form)
+    return float(ends[0]), float(ends[1])
 
 
 def _empty(delta: Tensor, cfg: Config) -> tuple[Tensor, dict[str, float]]:
@@ -93,7 +150,7 @@ def good_loss(
         return _empty(deltas.delta, cfg)
 
     excess = delta - c
-    per_term = F.relu(excess) if form == "relu" else F.softplus(excess)
+    per_term = good_penalty(excess, form)
     loss = per_term.mean()
 
     with torch.no_grad():
@@ -108,9 +165,12 @@ def good_loss(
             # Read THIS number rather than the estimate.
             "good/terms": float(delta.numel()),
             "good/delta_mean": float(delta.mean()),
-            # The sandwich is INCREASING in Delta (relu), the opposite of L_step's:
-            #   relu(delta_min - c) <= L_good <= relu(delta_max - c)
-            # and a lower bound of exactly 0 is a legitimate reading, not a dead term (§18).
+            # The sandwich is INCREASING in Delta, the opposite of L_step's, in whichever
+            # form is configured: f(delta_min - c) <= L_good <= f(delta_max - c), via
+            # `good_bounds`. A lower bound of exactly 0 is legitimate, not a dead term (§18).
+            # delta_max is also the number `relu_squared` exists for -- it read 7.58 mid-run
+            # under `relu` while the mean sat at -0.412, and the square is what makes that
+            # single term cost ~68 instead of 8.3 (module docstring, §7.12).
             "good/delta_min": float(delta.min()),
             "good/delta_max": float(delta.max()),
             "good/margin": c,

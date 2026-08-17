@@ -38,6 +38,7 @@ from feynman_prm.data.math_shepherd import (
 )
 from feynman_prm.data.tokenize import EmptyStep, SequenceTooLong, build_sequence, sep_token_id
 from feynman_prm.model.backbone import load_tokenizer
+from feynman_prm.data.prefix_hash import prefix_hashes
 
 
 def tokenise_split(questions, tokenizer, sep_id, cfg, split_name):
@@ -72,6 +73,10 @@ def tokenise_split(questions, tokenizer, sep_id, cfg, split_name):
                     "state_pos": np.asarray(seq.state_pos, dtype=np.int32),
                     "span_start": np.asarray([s for s, _ in seq.step_spans], dtype=np.int32),
                     "span_end": np.asarray([e for _, e in seq.step_spans], dtype=np.int32),
+                    # (T+1,) aligned with state_pos -- the §7.5.3-(b) CF join key. Hashed
+                    # from the RAW question and steps, never from the token ids, so the CF
+                    # jsonl (which has no tokeniser) computes the same value.
+                    "prefix_hash": prefix_hashes(question.prompt, list(traj.steps)),
                 }
             )
     return rows, dropped

@@ -35,6 +35,11 @@ class SequenceRow:
     correct: bool
     z: int                     # first error index, 0-based; -1 if fully correct (§6.1)
     recovery: bool = False
+    # (T+1,) int64, aligned with state_pos: the §7.5.3-(b) join key that lets a CF example
+    # reuse a prefix already forwarded in this batch. None on rows read from a parquet
+    # written before 2026-08-15; `cf_attach` treats a None row as "carries no prefix" and
+    # counts it, rather than crashing a run on a stale file.
+    prefix_hash: np.ndarray | None = None
 
     @property
     def n_steps(self) -> int:
@@ -78,6 +83,11 @@ class Batch:
     qids: tuple[str, ...]          # per-trajectory question ids, for logging
     n_real_tokens: int
     n_pad_tokens: int
+
+    # (S,) int64, aligned with state_flat_idx: `prefix_hash` of each state (§7.5.3-(b)).
+    # 0 marks a state whose row carried no hash (a pre-2026-08-15 parquet); `cf_attach`
+    # skips those rather than matching on a sentinel.
+    state_prefix_hash: Tensor = None  # type: ignore[assignment]
 
     # ---- shapes ----
     @property
@@ -128,7 +138,7 @@ def collate(rows: Sequence[SequenceRow], pad_id: int) -> Batch:
         mask[b, : row.length] = 1
 
     qid_to_index: dict[str, int] = {}
-    state_flat, state_traj, state_step = [], [], []
+    state_flat, state_traj, state_step, state_prefix_hash = [], [], [], []
     traj_offset, traj_terminal = [], []
     row_src, row_dst, row_traj, row_step = [], [], [], []
     span_token_idx, span_row_idx, span_counts = [], [], []
@@ -139,10 +149,23 @@ def collate(rows: Sequence[SequenceRow], pad_id: int) -> Batch:
         traj_offset.append(offset)
         T = row.n_steps
 
+        # 0 for a row with no prefix_hash: `cf_attach` never matches on 0, so a stale
+        # parquet degrades to "no CF attaches here" instead of mis-joining.
+        row_prefix = row.prefix_hash if row.prefix_hash is not None else np.zeros(T + 1, dtype=np.int64)
+        # A short `prefix_hash` would otherwise IndexError deep in the loop, or -- if it were
+        # LONG -- silently bind CF examples to the wrong states. It must be one entry per
+        # state, exactly like `state_pos`.
+        if len(row_prefix) != T + 1:
+            raise ValueError(
+                f"prefix_hash has {len(row_prefix)} entries for a {T}-step trajectory "
+                f"(expected T+1 = {T + 1}), qid {row.qid!r}. It is indexed by state, so it "
+                "must be built from the SAME step list the sequence was tokenised from."
+            )
         for i, pos in enumerate(row.state_pos):
             state_flat.append(b * L + int(pos))
             state_traj.append(b)
             state_step.append(i)
+            state_prefix_hash.append(int(row_prefix[i]))
         traj_terminal.append(offset + T)
 
         for i in range(1, T + 1):
@@ -189,6 +212,7 @@ def collate(rows: Sequence[SequenceRow], pad_id: int) -> Batch:
         qids=tuple(r.qid for r in rows),
         n_real_tokens=n_real,
         n_pad_tokens=B * L - n_real,
+        state_prefix_hash=long_(state_prefix_hash),
     )
 
 

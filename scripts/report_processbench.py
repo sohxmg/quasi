@@ -63,11 +63,16 @@ def main(argv: list[str] | None = None) -> int:
             f"\n  val F1 {cal['calibration/f1']:.4f}   sensitivity +/-0.1 -> "
             f"{cal['calibration/sensitivity']:.4f}"
         )
-        if tau > expected + 1.0:
+        # MULTIPLICATIVE, not additive. `expected` is 0.347; an additive slack of 1.0 lets a
+        # 3.4x overshoot print "the margin held" -- which is exactly what tau=1.1685 did on
+        # 2026-07-30. The quantity has no natural additive scale; the ratio is the reading.
+        if tau > 2.0 * expected:
             print(
                 f"  ** tau is {tau / max(expected, 1e-9):.1f}x the natural midpoint. It is "
                 "climbing to dodge a\n     good-step Delta tail (§7.12, diagnostic #14), and "
                 "TPR dies with it. The F1\n     below is bounded by that, NOT by the goal head."
+                "\n     Read good/above_target_fraction and #14's p90/p99 for THIS run before"
+                "\n     touching the goal head."
             )
         elif abs(tau) < 0.05:
             print(

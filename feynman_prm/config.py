@@ -103,9 +103,19 @@ class DataConfig:
     prompt_format: str = "raw"
     n_questions: int = 23000
     n_val_questions: int = 2000
+    # (4) L_CF's data, attached to the MAIN batch (§7.5.3 option (b), 2026-08-15). A glob of
+    # generator output; "" disables the CF path entirely and (4) stays an exact zero.
+    cf_glob: str = ""
+    # Cap on CF examples attached per micro-batch. A batch that happens to hold many
+    # CF-covered questions must not swing L_CF's magnitude, and the cap is what keeps the
+    # per-step cost flat. 12 covers the ~9.3/batch an epoch needs at 27,114 examples over
+    # ~2,920 micro-batches, with headroom for the uneven ones.
+    cf_max_per_batch: int = 12
 
     def __post_init__(self) -> None:
         _one_of("data.prompt_format", self.prompt_format, ("raw", "chat"))
+        if self.cf_max_per_batch < 0:
+            raise ConfigError("data.cf_max_per_batch must be >= 0")
 
 
 @dataclass(frozen=True)
@@ -115,6 +125,22 @@ class SamplingConfig:
     max_correct_per_question: int = 4
     max_incorrect_per_question: int = 3
     nce_mask_same_traj: bool = False
+    # **§16.4's false negative -- the surgical version of the switch above, and the one to
+    # run.** Drops only the same-trajectory rows BETWEEN the sampled positive and the goal:
+    # goal at s_6 with positive phi_3 masks phi_4/phi_5/phi_6, which are all nearer the goal
+    # than the positive is. Rows earlier than the positive stay (honest hard negatives). Also
+    # dissolves the 29.6% duplicate-column contradiction. ~0.64 rows of ~347. §9.9.2.
+    nce_mask_nearer_same_traj: bool = False
+    # Drops SAME-QUESTION, CORRECT-trajectory rows from the L_NCE negative pool -- they are
+    # false negatives (two correct solutions to one problem end in the same place). A targeted
+    # exception to locked #12, OFF by default, needs sign-off. See losses/nce.py.
+    # OVER-BROAD by §16.25(a)'s own admission; prefer `nce_mask_sibling_correct_late`.
+    nce_mask_same_question_correct: bool = False
+    # §16.25(a)'s position-aware variant: only the LATE states of a sibling correct trajectory,
+    # and only against TERMINAL goal columns. §9.9.5.
+    nce_mask_sibling_correct_late: bool = False
+    # Steps remaining to a row's OWN terminal for it to count as "late". 1 keeps {T, T-1}.
+    nce_sibling_late_margin: int = 1
     group_by_length: bool = True
 
     def __post_init__(self) -> None:
@@ -159,13 +185,22 @@ class GoodLossConfig:
     """(6) L_good internals (§7.12). `margin_steps` here is the TARGET, not a slack."""
 
     margin_steps: float = 1.0
+    # The code default stays `relu` -- §7.12's ablation is the only measurement of any form
+    # and it is relu-vs-softplus. **config/default.yaml ships `relu_squared` since
+    # 2026-08-04** (the same split as `lambda_good`, whose code default is 0.0 and whose
+    # shipped value is 1.0): a linear hinge on a MEAN is indifferent between many small
+    # violations and one large one, and mid-run that is exactly what happened -- the bulk
+    # moved (Delta mean +0.392 -> -0.412) while the tail ran away (frac_above_natural
+    # 0.070 -> 0.16, p99 0.86 -> 2.43, delta_max 7.58). The square prices a violator by HOW
+    # FAR out it is and keeps relu's two load-bearing properties: exactly zero below `c` and
+    # exactly zero gradient AT `c`. §7.12, losses/good.py.
     form: str = "relu"
     include_incorrect_prefix: bool = True
     detach_goal: bool = False
     warmup_steps: int = 100
 
     def __post_init__(self) -> None:
-        _one_of("losses.good_loss.form", self.form, ("relu", "softplus"))
+        _one_of("losses.good_loss.form", self.form, ("relu", "relu_squared", "softplus"))
         if self.warmup_steps < 0:
             raise ConfigError(
                 f"losses.good_loss.warmup_steps must be >= 0, got {self.warmup_steps}. "
@@ -210,6 +245,28 @@ class LossesConfig:
     lambda_cf: float = 0.0
     lambda_step: float = 1.0
     lambda_good: float = 0.0
+    # (7) L_term -- §7.13 / §16.26. The CODE default stays 0.0; **config/default.yaml ships
+    # 1.0 since 2026-08-15**, the same split `lambda_good` and `good_loss.form` already use.
+    # The term is computed and logged at every weight (its diagnostics are what decide whether
+    # it is worth training) and `0.0 * L_term` is an exact zero, so the total is bit-identical
+    # with and without it at the code default.
+    lambda_term: float = 0.0
+    # (7)'s SupCon temperature. A CONFIG KEY as of 2026-08-15, not a function argument:
+    # §7.13's rule is that whoever raises `lambda_term` picks `tau` in the same change rather
+    # than inheriting an unexamined default, and a default nobody has to type is exactly what
+    # "unexamined" means. 1.0 -- see config/default.yaml for the arithmetic. `tau` and
+    # `lambda` are the same knob here (the CE gradient on distances scales as 1/tau), so
+    # moving this moves `lambda_term` by the reciprocal.
+    lambda_term_temperature: float = 1.0
+    # (4)'s SupCon temperature. A CONFIG KEY as of 2026-08-18 for exactly the reason
+    # `lambda_term_temperature` became one: it was UNPLUMBED -- `total.py` called
+    # `counterfactual_loss` with no `temperature=`, so `lambda_cf` went 0.0 -> 1.0 in the
+    # 2026-08-15 run against a 1.0 nobody picked. §7.13's rule is that whoever turns a term on
+    # picks its tau as an explicit key. The CODE default stays 1.0 -- the same code-default /
+    # yaml-split `lambda_term` uses -- and **config/default.yaml ships 0.1**; see there for the
+    # arithmetic. `tau` and `lambda` are the same knob (the CE gradient on distances scales as
+    # 1/tau), so moving this moves `lambda_cf` by the reciprocal.
+    lambda_cf_temperature: float = 1.0
     nce_temperature: float = 1.0
     action_invariance: ActionInvarianceConfig = field(default_factory=ActionInvarianceConfig)
     step_loss: StepLossConfig = field(default_factory=StepLossConfig)
@@ -222,6 +279,12 @@ class LossesConfig:
             raise ConfigError("losses.nce_temperature must be > 0")
         if self.lambda_good < 0:
             raise ConfigError("losses.lambda_good must be >= 0")
+        if self.lambda_term < 0:
+            raise ConfigError("losses.lambda_term must be >= 0")
+        if self.lambda_term_temperature <= 0:
+            raise ConfigError("losses.lambda_term_temperature must be > 0")
+        if self.lambda_cf_temperature <= 0:
+            raise ConfigError("losses.lambda_cf_temperature must be > 0")
         if self.lambda_step > 0 and self.action_invariance.mode != "diagonal":
             raise ConfigError(
                 "losses.action_invariance.mode != 'diagonal' with lambda_step > 0. The grid "
@@ -259,9 +322,10 @@ class TrainConfig:
 @dataclass(frozen=True)
 class GoalHeadConfig:
     lr: float = 1.0e-3
-    epochs: int = 20
+    epochs: int = 100
     batch_size: int = 512
     max_terminals_per_question: int = 8
+    val_questions: int = 2000
 
 
 @dataclass(frozen=True)
@@ -270,10 +334,17 @@ class EvalConfig:
     max_len: int = 2048
     batch_sequences: int = 16
     skyline: bool = True
+    # §9.1 step 6. `first_crossing` is the shipped rule and every reported number is that
+    # rule -- §9.6.1's prose says `argmax` and is WRONG about what runs (§9.9.1). argmax is
+    # worth +0.017 mean F1 on ProcessBench, but **that table is fit on ProcessBench and §9.2
+    # forbids choosing on it.** Move this only on a Math-Shepherd-val comparison.
+    localisation_rule: str = "first_crossing"
 
     def __post_init__(self) -> None:
         for s in self.subsets:
             _one_of("eval.subsets", s, ("gsm8k", "math", "olympiadbench", "omnimath"))
+        _one_of("eval.localisation_rule", self.localisation_rule,
+                ("first_crossing", "argmax"))
 
 
 @dataclass(frozen=True)

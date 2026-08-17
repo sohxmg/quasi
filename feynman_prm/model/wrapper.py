@@ -107,6 +107,31 @@ class FeynmanPRM(nn.Module):
         phi = self.phi(h_states.index_select(0, batch.row_src), act)
         return Reps(h_states=h_states, psi=psi, phi=phi, act_emb=act)
 
+    def cf_phi(self, h_states: Tensor, attached) -> Tensor:
+        """`(V, D)` phi for CF variants, reusing this batch's own `h_states` (§7.5.3-(b)).
+
+        **NO LM FORWARD HAPPENS HERE.** `h_{i-1}` is already computed -- `variant_state`
+        indexes the state the variant departs from -- so a variant costs one embedding
+        lookup, a segment mean and an MLP, which is the entire reason option (b) was chosen
+        over the interleaved loader. The embedding table is the SAME `get_input_embeddings()`
+        the main path pools over (§6.4), so `act_emb` means the same thing on both paths;
+        pooling a variant through a different table would make `d(anchor, positive)`
+        incomparable to any distance in the main loss.
+
+        Gradients flow into the embedding table and the phi head, and through `h_states`
+        into the backbone -- the CF gradient reaches the LM via the shared prefix, which is
+        what makes this a joint update rather than a head-only one.
+        """
+        emb = self.backbone.get_input_embeddings()(attached.variant_tokens)   # (V, L_var, H)
+        act = self.action_pool(
+            emb,
+            attached.variant_token_idx,
+            attached.variant_row_idx,
+            attached.variant_counts,
+            attached.n_variants,
+        ).to(self.head_dtype)
+        return self.phi(h_states.index_select(0, attached.variant_state), act)
+
     @torch.no_grad()
     def encode_states(self, input_ids: Tensor, attention_mask: Optional[Tensor], flat_idx: Tensor):
         """Forward-only hidden extraction at given flat positions. Used by phase 2's cache

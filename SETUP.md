@@ -214,6 +214,11 @@ Output files:
 ```
 data/processed/
   sequences.parquet              pre-tokenised train+val rows (~200 MB)
+  sequences.cache.npz            the SAME rows as flat numpy arrays -- what training actually
+                                 loads (§14 B15: pyarrow and torch in one process abort on
+                                 free()). Written here, and rebuilt in a child interpreter by
+                                 the first reader whenever the parquet's size or mtime moves.
+                                 Delete it freely; it costs one conversion to get back.
   selection.json                 SHAs, counts, the real length distribution
   train_questions.txt            the ACTUAL selected ids, not a seed that implies them
   val_questions.txt

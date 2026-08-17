@@ -20,10 +20,35 @@ def test_defaults_match_the_locked_decisions(cfg):
     assert cfg.losses.action_invariance.mode == "diagonal"       # locked #16
     assert cfg.losses.step_loss.pairing == "boundary"            # locked #3b
     assert cfg.losses.lambda_step == 1.0                         # not optional (§7.6.2)
-    assert cfg.sampling.nce_mask_same_traj is False              # locked #12
+    assert cfg.sampling.nce_mask_same_traj is False              # locked #12, the BLUNT one
     assert cfg.sampling.sequences_per_micro_batch == 56          # §8.1
     assert cfg.sampling.max_padded_tokens == 32768               # measured 2026-07-27
     assert cfg.model.name == "Qwen/Qwen2.5-Math-1.5B-Instruct"
+
+
+def test_the_2026_08_04_run_config(cfg):
+    """The three changes that ship together, pinned so none of them reverts silently. Each
+    would leave a healthy-looking set of curves behind it -- which is the whole reason these
+    are tests and not comments.
+
+    They are also three changes in one run, so the attribution re-runs are named here:
+    `--set losses.nce_temperature=1.0`, `--set losses.good_loss.form=relu`,
+    `--set sampling.nce_mask_nearer_same_traj=false`, each with its own `run.name`."""
+    # tau_NCE = sqrt(latent_dim), i.e. TMD's own `-dist / sqrt(phi.shape[-1])` (tmd.py:92).
+    # Reverses §7.2's documented divergence, which shipped 1.0 for every run to date.
+    assert math.isclose(cfg.losses.nce_temperature, math.sqrt(cfg.heads.latent_dim), rel_tol=1e-6)
+    # §9.9.2 / §16.4: the SURGICAL mask (rows between the positive and the goal), not the
+    # blunt one above -- rows EARLIER than the positive stay, they are honest hard negatives.
+    assert cfg.sampling.nce_mask_nearer_same_traj is True
+    # §9.9.7's order of work runs the nearer mask alone first; these two stay off.
+    assert cfg.sampling.nce_mask_sibling_correct_late is False
+    assert cfg.sampling.nce_mask_same_question_correct is False
+    # §7.12: relu moved the bulk and lost the tail. Never softplus -- it applies gradient AT
+    # the target and stretches L_T's ruler (measured overshoot to Delta = -1.556).
+    assert cfg.losses.good_loss.form == "relu_squared"
+    # One directory per loss-set change: `runs/phase1/` is the previous run and the baseline
+    # every §9.3.1 / §9.7 number was measured on.
+    assert cfg.run.name != "phase1"
 
 
 def test_derived_values_match_section_7_8s_table(cfg):

@@ -1,11 +1,17 @@
 """(4) L_CF's on-disk format and loader (§7.5). DATA IS DEFERRED; lambda_cf = 0.
 
     {"question": "...", "steps": ["...", "..."], "step_index": 2,
-     "positive_rewrite": "...", "negative_rewrites": ["...", "..."]}
+     "positive_rewrites": ["...", "..."], "negative_rewrites": ["...", "..."]}
 
-`positive_rewrite` preserves the mathematical meaning of `steps[step_index]`;
+`positive_rewrites` preserve the mathematical meaning of `steps[step_index]`;
 `negative_rewrites` change it. The spec's procedure: "give Claude all steps, and ask it to
 change a particular step so that the underlying mathematical meaning is same."
+
+**`positive_rewrites` is PLURAL as of 2026-08-08** (was a single `positive_rewrite`). The
+anchor and its positives are one equivalence class, pulled together by the multi-positive
+L_CF; the generator requests 3 and keeps >=2. There is no migration path for the old
+single-positive records because none were ever generated -- the data has always been
+deferred.
 
 **The cost claim §7.5 gets wrong** (PLAN finding 1). §7.5 says "each perturbed step needs
 its own LM forward, so cap how many appear per batch". But `phi_i = phi(h_{i-1}, act_emb_i)`
@@ -38,14 +44,18 @@ class CounterfactualExample:
     question: str
     steps: tuple[str, ...]
     step_index: int              # 0-based index of the rewritten step
-    positive_rewrite: str
+    positive_rewrites: tuple[str, ...]
     negative_rewrites: tuple[str, ...]
 
     def __post_init__(self) -> None:
         if not 0 <= self.step_index < len(self.steps):
             raise ValueError(f"step_index {self.step_index} out of range for {len(self.steps)} steps")
+        if not self.positive_rewrites:
+            raise ValueError(
+                "L_CF pulls an equivalence class together: it needs at least one positive rewrite"
+            )
         if not self.negative_rewrites:
-            raise ValueError("L_CF is a cross-entropy: it needs at least one negative rewrite")
+            raise ValueError("L_CF is a contrastive loss: it needs at least one negative rewrite")
 
 
 def read_jsonl(path: str | Path) -> list[CounterfactualExample]:
@@ -60,11 +70,62 @@ def read_jsonl(path: str | Path) -> list[CounterfactualExample]:
                     question=record["question"],
                     steps=tuple(record["steps"]),
                     step_index=int(record["step_index"]),
-                    positive_rewrite=record["positive_rewrite"],
+                    positive_rewrites=tuple(record["positive_rewrites"]),
                     negative_rewrites=tuple(record["negative_rewrites"]),
                 )
             )
     return examples
+
+
+def read_cf_glob(pattern: str) -> list[CounterfactualExample]:
+    """Every CF example matching a COMMA-SEPARATED list of globs, deduplicated on
+    `(question, step_index)`.
+
+    **Comma-separated and not one bare glob, because a bare glob is a foot-gun here.** The
+    generator writes five files per campaign and only ONE of them is kept examples:
+    `cf70k.jsonl` beside `cf70k.raw.jsonl`, `.rejected.jsonl`, `.discarded.jsonl` and
+    `.responses.jsonl`. `data/cf/cf70k*.jsonl` matches all sixteen files in that directory
+    and only three are the ones wanted -- the rest have different schemas, so the failure is
+    a `KeyError` deep in a launch if you are lucky and silently wrong data if you are not.
+    Listing the three explicitly is the only form that cannot pick up a sibling.
+
+    The campaigns were assigned DISJOINT contiguous slices of the selection order
+    (bharatcode ranks 1-1,064, gemini 13,209-32,863, openai 32,873-34,321 as of 2026-08-15),
+    so the dedup should be a no-op -- it is here because a re-run written to a new filename
+    is the obvious way that stops being true, and two copies of one example would silently
+    double its weight in L_CF. Files are read in sorted order so the survivor of a duplicate
+    is deterministic.
+    """
+    from glob import glob
+
+    paths: list[str] = []
+    for part in pattern.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        matched = sorted(glob(part))
+        if not matched:
+            raise FileNotFoundError(f"data.cf_glob pattern matched no files: {part!r}")
+        paths.extend(matched)
+
+    seen: set[tuple[str, int]] = set()
+    out: list[CounterfactualExample] = []
+    for path in sorted(set(paths)):
+        try:
+            examples = read_jsonl(path)
+        except KeyError as exc:
+            raise ValueError(
+                f"{path} is not a CF example file: no {exc} field. The generator's kept "
+                "output is `<campaign>.jsonl`; `.raw`, `.rejected`, `.discarded` and "
+                "`.responses` are different schemas and must not be in data.cf_glob."
+            ) from exc
+        for ex in examples:
+            key = (ex.question, ex.step_index)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(ex)
+    return out
 
 
 def write_jsonl(examples: Sequence[CounterfactualExample], path: str | Path) -> None:
@@ -78,7 +139,7 @@ def write_jsonl(examples: Sequence[CounterfactualExample], path: str | Path) -> 
                         "question": ex.question,
                         "steps": list(ex.steps),
                         "step_index": ex.step_index,
-                        "positive_rewrite": ex.positive_rewrite,
+                        "positive_rewrites": list(ex.positive_rewrites),
                         "negative_rewrites": list(ex.negative_rewrites),
                     }
                 )
@@ -88,8 +149,9 @@ def write_jsonl(examples: Sequence[CounterfactualExample], path: str | Path) -> 
 
 @dataclass
 class CounterfactualBatch:
-    """A CF micro-batch. Variant 0 of each example is the ORIGINAL step (the anchor),
-    variant 1 is the meaning-preserving positive, variants 2.. are the negatives."""
+    """A CF micro-batch. Within each example the variants run anchor, then every
+    meaning-preserving positive, then every meaning-changing negative -- `variant_kind`
+    0, then 1 repeated, then 2 repeated. **Nothing may assume exactly one kind-1 row.**"""
 
     input_ids: Tensor            # (N, L) prefix sequences, one per example
     attention_mask: Tensor | None
@@ -146,7 +208,7 @@ def build_cf_batch(
 
         for kind, text in (
             (0, ex.steps[ex.step_index]),
-            (1, ex.positive_rewrite),
+            *[(1, pos) for pos in ex.positive_rewrites],
             *[(2, neg) for neg in ex.negative_rewrites],
         ):
             ids = tokenizer(text, add_special_tokens=False)["input_ids"]

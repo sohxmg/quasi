@@ -18,15 +18,19 @@ Run it under tmux. `export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` fir
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import math
 from pathlib import Path
 
 import torch
 
 from .config import Config, load_config
+from .data.cf_attach import CFContext, select_cf_examples_for_train
 from .data.collate import collate
+from .data.counterfactual import read_cf_glob
 from .data.goals import sample_goals
 from .data.math_shepherd import read_sequences_parquet
+from .data.sequence_cache import question_ids
 from .data.sampler import (
     batch_stats,
     build_question_slots,
@@ -38,6 +42,7 @@ from .data.sampler import (
 )
 from .diagnostics.logging import RunLogger
 from .diagnostics.probes import asymmetry_score, batch_probes
+from .losses.good import good_bounds
 from .losses.matrix import build_matrices
 from .losses.total import expected_init_values, phase1_loss
 from .model.backbone import (
@@ -72,14 +77,28 @@ def build_scheduler(optimizer, total_steps: int, cfg: Config):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def run_micro_batch(model, rows, batch_rows, cfg: Config, device, rng, step: int = 0):
-    """One micro-batch: collate -> goals -> forward -> matrices -> loss."""
+def run_micro_batch(model, rows, batch_rows, cfg: Config, device, rng, step: int = 0, cf_ctx=None):
+    """One micro-batch: collate -> goals -> attach CF -> forward -> matrices -> loss.
+
+    `cf_ctx` is the §7.5.3-(b) attachment context (`CFContext` or None). When present, the
+    CF examples whose prefix is already in THIS batch are attached and their phi is computed
+    off this batch's own `h_states` -- one forward, one backward, one optimizer step for the
+    main losses and L_CF together, which is what "in the main batch only" means. With no
+    context, or when nothing attaches, `cf` is None and (4) contributes an exact zero.
+    """
     # Goals are drawn on the CPU batch (the sampler is numpy, and there are no DataLoader
     # workers to seed), then both move to the device together.
     batch_cpu = collate([rows[i] for i in batch_rows], pad_id=model.pad_id)
     goals = sample_goals(batch_cpu, cfg.discount, rng).to(device)
+    # The join runs on the CPU batch: it reads `state_prefix_hash` and builds index tensors,
+    # so doing it after `.to(device)` would move ints to the GPU only to read them back.
+    attached = cf_ctx.attach(batch_cpu, rng) if cf_ctx is not None else None
     batch = batch_cpu.to(device)
     reps = model(batch)
+    cf = None
+    if attached is not None:
+        attached = attached.to(device)
+        cf = (model.cf_phi(reps.h_states, attached), attached.variant_example, attached.variant_kind)
     matrices = build_matrices(reps.psi, reps.phi, batch, goals, model.distance, cfg)
     out = phase1_loss(
         reps.psi,
@@ -90,7 +109,10 @@ def run_micro_batch(model, rows, batch_rows, cfg: Config, device, rng, step: int
         cfg,
         goal_traj=goals.goal_traj,
         step=step,          # (6) L_good's warmup ramp only (§7.12)
+        cf=cf,
     )
+    if attached is not None:
+        out.info.update(attached.info)
     return batch, goals, reps, matrices, out
 
 
@@ -101,6 +123,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--allow-short-run", action="store_true",
                         help="skip the >=300 optimizer-step assert (smoke tests only)")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="write into a run directory that already holds a checkpoint")
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config, args.set)
@@ -108,13 +132,49 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config(args.config, args.set + [f"train.max_steps={args.max_steps}"])
     seed_everything(cfg.run.seed)
 
+    # **A probe writes to its own directory.** `--max-steps 20` runs the same code path and
+    # ends with the same `save_checkpoint(.../final)`, so before 2026-08-04 the documented
+    # workflow -- probe, read the launch blocks, then launch for real -- left a 20-step
+    # `final/` sitting exactly where the real run wanted to write. Suffixing is better than
+    # exempting: the probe's checkpoint stays on disk to be inspected, its wandb run stops
+    # sharing a name with the real one, and the collision cannot happen in either direction.
+    if cfg.train.max_steps is not None:
+        cfg = dataclasses.replace(
+            cfg, run=dataclasses.replace(cfg.run, name=f"{cfg.run.name}_probe")
+        )
+        print(f"[probe] max_steps={cfg.train.max_steps} -> writing to {cfg.run.name}/ "
+              f"(disposable; the guard does not apply)", flush=True)
+
+    # A run directory is not resumable and never has been -- a loss-set change invalidates the
+    # checkpoint (§7.12), so every experiment gets its own `run.name`. What this guards is the
+    # accident: launching with the PREVIOUS name still in the yaml silently overwrites the
+    # checkpoint the last set of reported numbers came from, and the only symptom is that
+    # `runs/<name>/final` now answers to different weights than the numbers quoted against it.
+    # Nothing downstream can detect that, so it is checked here, before the GPU is touched.
+    # Probes are exempt: they are disposable by construction and re-probing is routine.
+    # Keyed on `heads.pt`, not `config.yaml`: the config is a sidecar that proves nothing was
+    # trained, while `heads.pt` IS the artifact -- save_checkpoint refuses to write it empty
+    # (§14: the stock PEFT path drops the heads silently), so its presence means real weights.
+    run_dir = Path(cfg.run.out_dir) / cfg.run.name
+    existing = sorted(
+        p.name for p in run_dir.glob("*") if p.is_dir() and (p / "heads.pt").exists()
+    )
+    if existing and cfg.train.max_steps is None and not args.overwrite:
+        raise SystemExit(
+            f"{run_dir} already holds checkpoint(s): {', '.join(existing)}.\n"
+            f"Change `run.name` in {args.config} (one directory per loss-set change), or pass "
+            f"--overwrite if you really mean to discard them.\n"
+            f"If these came from a --max-steps probe, they are disposable: rm -rf {run_dir}"
+        )
+
     logger = RunLogger(
         cfg.run.out_dir, cfg.run.name, cfg.log.wandb, cfg.log.wandb_project, cfg.to_dict()
     )
     cfg.save(Path(cfg.run.out_dir) / cfg.run.name / "config.resolved.yaml")
 
     # ---- data -----------------------------------------------------------------------
-    rows = read_sequences_parquet(Path(cfg.data.dir) / "sequences.parquet", split="train")
+    sequences_path = Path(cfg.data.dir) / "sequences.parquet"
+    rows = read_sequences_parquet(sequences_path, split="train")
     slots = build_question_slots(rows)
     rng = epoch_rng(cfg.run.seed, 0)
     batches = epoch_batches(rows, slots, cfg, 0, rng)
@@ -149,6 +209,76 @@ def main(argv: list[str] | None = None) -> int:
     model.to(device)
     model.train()   # must precede the memory probe: eval mode disables gradient checkpointing
 
+    # ---- (4) L_CF's data, attached to the main batch (§7.5.3-(b)) ---------------------
+    # Built after the tokenizer and before the probe, so the memory probe measures a batch
+    # that CARRIES CF variants. A probe that skipped them would under-measure peak VRAM by
+    # exactly the tensor this change adds.
+    cf_ctx = None
+    if cfg.data.cf_glob and cfg.data.cf_max_per_batch > 0:
+        cf_examples = read_cf_glob(cfg.data.cf_glob)
+        # §8.2: a CF example on a VAL question would be silent leakage into phase 1 -- the one
+        # failure this path could cause that no curve would show -- so it is asserted rather
+        # than assumed. It needs the VAL qids to say that, not just the train ones: a question
+        # whose every trajectory was dropped at tokenisation (§4.6) is in the selection and
+        # absent from the rows, and charging that to leakage is what stopped the 2026-08-16
+        # launch over 4 of 27,114 examples. `select_cf_examples_for_train` separates them.
+        kept, cf_split_info = select_cf_examples_for_train(
+            cf_examples,
+            {r.qid for r in rows},
+            question_ids(sequences_path, split="val"),
+        )
+        if cf_split_info["examples_dropped_question_absent"]:
+            print(
+                f"[cf] {cf_split_info['examples_dropped_question_absent']} of "
+                f"{len(cf_examples)} CF examples sit on "
+                f"{cf_split_info['questions_absent']} question(s) that are in NO split of "
+                f"sequences.parquet -- every trajectory of those questions was dropped at "
+                f"tokenisation (§4.6), so there is no prefix to attach to. Dropped, and in "
+                f"the launch/cf_data event.",
+                flush=True,
+            )
+        # A parquet written before 2026-08-15 has no `prefix_hash` column. `cf_attach` never
+        # matches on a missing hash, so it degrades to "nothing attaches" -- which is exactly
+        # right while lambda_cf is 0 and exactly WRONG once it is not: (4) would then be
+        # weighted, fed, logged and training on nothing, with every other curve healthy. That
+        # is §14's whole family (B11, B12), so at a nonzero weight it is a HARD ERROR at
+        # launch rather than a number to notice in `cf/attach_rate` three hours in.
+        if cfg.losses.lambda_cf > 0:
+            n_hashed = sum(r.prefix_hash is not None for r in rows)
+            if n_hashed == 0:
+                raise AssertionError(
+                    f"losses.lambda_cf = {cfg.losses.lambda_cf} but not one of {len(rows)} "
+                    f"rows in {cfg.data.dir}/sequences.parquet carries a `prefix_hash` "
+                    f"column, so NOTHING would attach and (4) would train on nothing while "
+                    f"every other curve looked healthy (§7.5.13). Re-run "
+                    f"`python scripts/prepare_data.py`, or set losses.lambda_cf=0.0."
+                )
+            if n_hashed < len(rows):
+                raise AssertionError(
+                    f"{len(rows) - n_hashed} of {len(rows)} rows carry no `prefix_hash` -- "
+                    f"the parquet is a MIX of pre- and post-2026-08-15 writes, which silently "
+                    f"biases which CF examples can attach. Re-run scripts/prepare_data.py."
+                )
+        cf_ctx = CFContext(kept, tokenizer, tokenizer.pad_token_id, cfg.data.cf_max_per_batch)
+        logger.event(
+            "launch/cf_data",
+            {
+                "examples": len(kept),
+                "distinct_prefixes": len(cf_ctx.index),
+                "max_per_batch": cfg.data.cf_max_per_batch,
+                "lambda_cf": cfg.losses.lambda_cf,
+                # The §7.5.13 ceiling is 100% and the seeded draw measures 91.6%, so this is
+                # the number `cf/attach_rate` is read against. Far below it means the join is
+                # broken, not that the data is thin.
+                "rows_with_prefix_hash": sum(r.prefix_hash is not None for r in rows),
+                "rows": len(rows),
+                # The split audit: leakage is fatal above, so what lands here is the count of
+                # examples whose question has no rows at all. Logged rather than left silent
+                # because the drop is relied on (§14).
+                **cf_split_info,
+            },
+        )
+
     trainable = assert_phase1_trainable(model, cfg)   # §14: exactly {LoRA, psi, phi}
     logger.event(
         "launch/model",
@@ -179,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
     _, _, _, _, probe_out = run_micro_batch(
-        model, rows, batches[probe_idx], cfg, device, probe_rng(cfg.run.seed)
+        model, rows, batches[probe_idx], cfg, device, probe_rng(cfg.run.seed), cf_ctx=cf_ctx
     )
     probe_out.total.backward()
     optimizer.zero_grad(set_to_none=True)
@@ -206,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
         for micro, batch_rows in enumerate(batches):
             batch, goals, reps, matrices, out = run_micro_batch(
                 model, rows, batch_rows, cfg, device, goal_rng(cfg.run.seed, epoch, micro),
-                step=step,
+                step=step, cf_ctx=cf_ctx,
             )
             if not torch.isfinite(out.total):
                 raise RuntimeError(f"non-finite loss at epoch {epoch} micro {micro}: {out.info}")
@@ -220,6 +350,9 @@ def main(argv: list[str] | None = None) -> int:
                     out.info["backup/delta_mean"],
                     out.info["step/delta_mean"],
                     out.info["backup/linear_branch_fraction"],
+                    # (7) L_term's chance level is a property of the batch's ragged
+                    # min(4,k_c)/min(3,k_i) counts, not a constant (§7.13).
+                    out.info["term/chance"],
                 )
                 logger.event(
                     "launch/init_values",
@@ -235,16 +368,22 @@ def main(argv: list[str] | None = None) -> int:
                             "branch, so linear_branch_fraction ~ 1.0 and L_I ~ dist_mean ~ 11 "
                             "are both correct here (§7.4.3). L_NCE pinned at log(R) with "
                             "logit_std ~= 0 is bug B10a. L_good has NO predicted level (nan on "
-                            "purpose) -- check the sandwich relu(good/delta_min - c) <= L_good "
-                            "<= relu(good/delta_max - c), which runs OPPOSITE to L_step's, and "
-                            "note a lower bound of exactly 0 is legitimate (§7.12)."
+                            "purpose) -- check the sandwich f(good/delta_min - c) <= L_good "
+                            "<= f(good/delta_max - c) in the CONFIGURED form (good_form "
+                            "below), which runs OPPOSITE to L_step's, and note a lower bound "
+                            "of exactly 0 is legitimate (§7.12)."
                         ),
                         "step_delta_mean": round(out.info["step/delta_mean"], 4),
                         # §7.12: c must be NEGATIVE. It is derived, but it is printed at
                         # launch because the sign is the one thing about this term that no
                         # downstream curve would reveal if it were wrong.
                         "good_margin": round(cfg.good_margin, 4),
+                        "good_form": cfg.losses.good_loss.form,
                         "lambda_good": cfg.losses.lambda_good,
+                        # tau_NCE: 22.63 = sqrt(512) is TMD's own scaling (tmd.py:92) and
+                        # reverses §7.2's divergence. It divides logit_std by the same factor,
+                        # so read `logit_std * nce_temperature` against B10a, never logit_std.
+                        "nce_temperature": cfg.losses.nce_temperature,
                         "good_delta_mean": round(out.info["good/delta_mean"], 4),
                         "good_above_target_fraction": round(
                             out.info["good/above_target_fraction"], 4
@@ -256,18 +395,22 @@ def main(argv: list[str] | None = None) -> int:
                         ),
                     },
                 )
-                # §7.12/§18. relu is INCREASING in Delta, so this sandwich is the mirror of
-                # L_step's and it is exact -- the only tolerance is fp rounding on the mean.
-                # A lower bound of 0 is legitimate (every good step already at or below c);
-                # a violation means L_good is not the relu of its own logged deltas, which is
-                # a wrong `c`, a wrong sign on `c`, or a wrong scope mask.
+                # §7.12/§18. Every L_good form is INCREASING in Delta, so this sandwich is the
+                # mirror of L_step's and it is exact -- the only tolerance is fp rounding on
+                # the mean. A lower bound of 0 is legitimate (every good step already at or
+                # below c); a violation means L_good is not `f` of its own logged deltas,
+                # which is a wrong `c`, a wrong sign on `c`, or a wrong scope mask.
+                # `good_bounds` applies the CONFIGURED form -- a relu-shaped bound here would
+                # fire on a correct relu_squared run, which is the B11/B12 failure mode.
                 if out.info["good/terms"] > 0:
                     c = cfg.good_margin
-                    lo = max(out.info["good/delta_min"] - c, 0.0)
-                    hi = max(out.info["good/delta_max"] - c, 0.0)
+                    lo, hi = good_bounds(
+                        out.info["good/delta_min"], out.info["good/delta_max"], cfg
+                    )
                     good_now = float(out.terms["good"])
                     assert lo - 1e-4 <= good_now <= hi + 1e-4, (
-                        f"L_good {good_now:.6f} outside relu sandwich [{lo:.6f}, {hi:.6f}] at "
+                        f"L_good {good_now:.6f} outside the "
+                        f"{cfg.losses.good_loss.form} sandwich [{lo:.6f}, {hi:.6f}] at "
                         f"c = {c:.6f} (§7.12). Check the sign of good_margin first."
                     )
                 checked_init = True

@@ -1,7 +1,7 @@
 """Assemble the phase-1 loss (§7.0).
 
     L = lambda_NCE*L_NCE + lambda_I*L_I + zeta*L_T + lambda_CF*L_CF + lambda_step*L_step
-        + lambda_good*L_good
+        + lambda_good*L_good + lambda_term*L_term
 
 **zeta weights the BACKUP ONLY.** `tmd.py:124` is
 `contrastive_loss + action_invariance_loss + zeta * backup_loss` -- action invariance sits at
@@ -19,6 +19,12 @@ their gradient magnitudes are uncharacterised. Every curve is logged separately 
 losses.lambda_good=0.0` makes it inert -- the term is still computed and logged every step,
 because `good/above_target_fraction` is a diagnostic worth having whether or not it is being
 trained, and `0.0 * L_good` is an exact zero.
+
+(7) `L_term` is the §7.13 / §16.26 addition and it ships **OFF at `lambda_term = 0.0`**. It is
+computed unconditionally for the same reason (6) is: `term/within_question_terminal_spread` is
+the statistic §16.26 says decides whether the term is worth turning on, and it is worth
+plotting per step whether or not the term is being trained. `L_CF` is the one term still
+gated -- its DATA is deferred, so there is nothing to compute when `cf is None`.
 """
 
 from __future__ import annotations
@@ -32,6 +38,7 @@ from torch import Tensor
 from ..config import Config
 from ..data.collate import Batch
 from ..model.distances import Distance
+from .counterfactual import _empty_info as _empty_cf_info
 from .counterfactual import counterfactual_loss
 from .good import good_loss
 from .invariance import invariance_loss
@@ -39,6 +46,7 @@ from .matrix import Matrices
 from .nce import nce_loss
 from .step import step_loss
 from .temporal import temporal_loss
+from .terminal_class import terminal_class_loss
 
 
 @dataclass
@@ -92,8 +100,18 @@ def phase1_loss(
         matrices.pos_row,
         temperature=losses.nce_temperature,
         mask_same_traj=cfg.sampling.nce_mask_same_traj,
+        mask_nearer_same_traj=cfg.sampling.nce_mask_nearer_same_traj,
+        mask_same_question_correct=cfg.sampling.nce_mask_same_question_correct,
+        mask_sibling_correct_late=cfg.sampling.nce_mask_sibling_correct_late,
+        sibling_late_margin=cfg.sampling.nce_sibling_late_margin,
         row_traj=batch.row_traj,
         goal_traj=goal_traj,
+        row_step=batch.row_step,
+        goal_step=matrices.goal_step,
+        goal_is_terminal=matrices.goal_is_terminal,
+        # steps remaining to this row's OWN terminal, for the sibling-late mask (§9.9.5)
+        row_steps_to_end=batch.traj_T[batch.row_traj] - batch.row_step,
+        row_correct=batch.traj_correct[batch.row_traj],
         SQ=matrices.SQ,
     )
     l_i, inv_info = invariance_loss(
@@ -119,10 +137,31 @@ def phase1_loss(
     lambda_good_eff = losses.lambda_good * good_warmup_scale(cfg, step)
     good_info["good/lambda_effective"] = lambda_good_eff
 
+    # (7) L_term reads the terminal psi -- the same tensor D_term's columns come from, not a
+    # fresh head, and no extra LM forward (§7.13). Computed at every lambda_term for the same
+    # reason (6) is: term/within_question_terminal_spread is §16.26's own gauge.
+    # `tau` is passed EXPLICITLY and comes from the config: §7.13 requires whoever raises
+    # `lambda_term` to pick it in the same change, and a defaulted argument is a pick nobody
+    # made. It stays 1.0 -- (7)'s denominator is ~4.9 candidates, so sqrt(512) would flatten
+    # the softmax onto log(c-1+w) and act as an off switch rather than a temperature.
+    l_term, term_info = terminal_class_loss(
+        psi, batch, distance, temperature=losses.lambda_term_temperature
+    )
+
     if cf is not None and losses.lambda_cf > 0:
-        l_cf, cf_info = counterfactual_loss(*cf, distance=distance)
+        # `tau` is passed EXPLICITLY and comes from the config, exactly as (7)'s does.
+        # It was passed NOWHERE before 2026-08-18 -- this call inherited
+        # counterfactual_loss's 1.0 default, which is how (4) entered a gradient at a
+        # temperature nobody picked. See config/default.yaml for why it is 0.1.
+        l_cf, cf_info = counterfactual_loss(
+            *cf, distance=distance, temperature=losses.lambda_cf_temperature
+        )
     else:
-        l_cf, cf_info = matrices.Dist.sum() * 0.0, {"cf/loss": 0.0}
+        # The FULL key set, not just `cf/loss`. `counterfactual.py:_empty_info` exists
+        # because a diagnostic that vanishes on a degenerate batch cannot be plotted, and
+        # this branch used to defeat it -- at lambda_cf = 0, or on a batch where nothing
+        # attached, every other cf/* key disappeared from metrics.jsonl mid-run.
+        l_cf, cf_info = matrices.Dist.sum() * 0.0, _empty_cf_info()
 
     total = (
         losses.lambda_nce * l_nce
@@ -131,10 +170,11 @@ def phase1_loss(
         + losses.lambda_cf * l_cf
         + losses.lambda_step * l_step
         + lambda_good_eff * l_good        # §7.12, ramped over warmup_steps
+        + losses.lambda_term * l_term     # §7.13, 0.0 by default -- an exact zero
     )
 
     info: dict[str, float] = {"loss/total": float(total.detach())}
-    for part in (nce_info, inv_info, backup_info, step_info, good_info, cf_info):
+    for part in (nce_info, inv_info, backup_info, step_info, good_info, cf_info, term_info):
         info.update(part)
     return Phase1Loss(
         total=total,
@@ -145,6 +185,7 @@ def phase1_loss(
             "cf": l_cf,
             "step": l_step,
             "good": l_good,
+            "term": l_term,
         },
         info=info,
     )
@@ -157,6 +198,7 @@ def expected_init_values(
     mean_delta: Optional[float] = None,
     step_delta: float = 0.0,
     linear_fraction: Optional[float] = None,
+    term_chance: Optional[float] = None,
 ) -> dict[str, float]:
     """§18's initialisation probe. Compute these; do not eyeball them.
 
@@ -193,16 +235,28 @@ def expected_init_values(
       arriving near 11 is the geometry working as expected, not a fault.
 
     * `good` -- **deliberately `nan`. There is no level to predict** (§7.12, §18). L_good is
-      `mean relu(Delta - c)` over ~600 good transitions against a *negative* `c`, so its init
+      `mean f(Delta - c)` over ~600 good transitions against a *negative* `c`, so its init
       value is a property of the random psi's Delta distribution and nothing else. What IS
-      checkable is the sandwich, and note it runs OPPOSITE to L_step's because `relu` is
-      INCREASING in Delta:
+      checkable is the sandwich, and note it runs OPPOSITE to L_step's because every `f`
+      (`relu`, `relu_squared`, `softplus`) is INCREASING in Delta:
 
-          relu(good/delta_min - c)  <=  L_good  <=  relu(good/delta_max - c)
+          f(good/delta_min - c)  <=  L_good  <=  f(good/delta_max - c)
+
+      `losses.good.good_bounds` applies the configured form; do not reimplement it with a
+      hardcoded `relu`, which would fire on a correct `relu_squared` run.
 
       **A lower bound of exactly 0 is legitimate** -- it is what "every good step already sits
       at or below target" looks like, not a dead term. Predicting a level here and then
       "correcting" the code to hit it is the §7.4.3 / §7.6.7 mistake for the third time.
+
+    * `term` -- chance, exactly as `nce` is, but chance here is **not a constant**: a query of
+      question `q` sees `(c_q - 1)` positives and `w_q` negatives in one softmax, so a flat
+      `d` gives `mean_q log(c_q - 1 + w_q)` over the questions with `c_q >= 2`, and the
+      `min(4,k_c)/min(3,k_i)` counts are ragged (§8.1). `terminal_class_loss` computes it on
+      the batch and logs it as `term/chance`; pass that value here. `L_term` sitting AT it is
+      the correct reading at step 0 and says nothing is wrong -- the term ships at
+      `lambda_term = 0.0` (§7.13), so it is a diagnostic and is expected to stay near chance
+      for the whole run unless someone turns it on.
     """
     import math
 
@@ -233,4 +287,7 @@ def expected_init_values(
         # NOT a structural zero -- L_good is computed at every lambda_good, including 0.0.
         # nan means "no prediction is possible", and the probe asserts the sandwich instead.
         "good": float("nan"),
+        # Same: computed at every lambda_term, including the shipped 0.0 (§7.13). The
+        # prediction is the batch's own chance level, which only the batch knows.
+        "term": term_chance if term_chance is not None else float("nan"),
     }

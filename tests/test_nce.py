@@ -82,6 +82,130 @@ def test_same_trajectory_masking_never_masks_the_positive():
     assert float(loss) < float(unmasked)
 
 
+def _traj_fixture():
+    """One 6-step trajectory (rows phi_1..phi_6) plus a decoy trajectory.
+
+    Column 0: goal at s_6, positive phi_3  -> nearer set {phi_4, phi_5, phi_6}
+    Column 1: goal at s_6, positive phi_5  -> nearer set {phi_6}   (the DUPLICATE column)
+    """
+    R = 8
+    row_traj = torch.tensor([0, 0, 0, 0, 0, 0, 1, 1])
+    row_step = torch.tensor([1, 2, 3, 4, 5, 6, 1, 2])
+    goal_traj = torch.tensor([0, 0])
+    goal_step = torch.tensor([6, 6])
+    pos_row = torch.tensor([2, 4])                  # phi_3 (index 2), phi_5 (index 4)
+    Dist = torch.arange(R, dtype=torch.float)[:, None].repeat(1, 2)
+    return Dist, pos_row, row_traj, row_step, goal_traj, goal_step
+
+
+def test_nearer_mask_drops_only_rows_between_the_positive_and_the_goal():
+    """§9.9.2 / §16.4. Goal at s_6 with positive phi_3: phi_4, phi_5, phi_6 are all NEARER the
+    goal than the positive and `F.cross_entropy` currently marks them wrong. Rows EARLIER than
+    the positive must survive -- they are honest hard negatives and the only within-solution
+    gradient there is. That is the whole difference from `mask_same_traj`."""
+    Dist, pos_row, row_traj, row_step, goal_traj, goal_step = _traj_fixture()
+    kw = dict(row_traj=row_traj, row_step=row_step, goal_traj=goal_traj, goal_step=goal_step)
+
+    _, info = nce_loss(Dist, pos_row, mask_nearer_same_traj=True, **kw)
+    # column 0 masks {3,4,5}, column 1 masks {5}  ->  mean 2.0 per column
+    assert info["nce/negatives_masked"] == pytest.approx(2.0)
+    assert info["nce/negatives_effective"] == pytest.approx(7.0 - 2.0)
+
+    # the blunt switch drops the early rows too, which this one must not
+    _, blunt = nce_loss(Dist, pos_row, mask_same_traj=True, **kw)
+    assert blunt["nce/negatives_masked"] > info["nce/negatives_masked"]
+
+
+def test_nearer_mask_dissolves_the_duplicate_column_contradiction():
+    """29.6% of goal columns are byte-identical to another with a DIFFERENT positive
+    (`probe01/distinct_goal_ratio` = 0.704, §9.9.3). Both columns of the fixture have goal s_6.
+    Unmasked, column 0 asserts phi_3 > phi_5 while column 1 asserts phi_5 > phi_3 -- the two
+    gradients oppose inside one backward pass. Masked, only column 1 speaks about the pair, and
+    it says what L_T says."""
+    Dist, pos_row, row_traj, row_step, goal_traj, goal_step = _traj_fixture()
+    kw = dict(row_traj=row_traj, row_step=row_step, goal_traj=goal_traj, goal_step=goal_step)
+
+    excluded = nce_loss(Dist, pos_row, mask_nearer_same_traj=True, **kw)[0]
+    logits = -Dist
+    # column 0 no longer ranks phi_5 at all; column 1 still ranks phi_3
+    assert torch.isfinite(excluded)
+    d = Dist.clone().requires_grad_(True)
+    loss = nce_loss(d, pos_row, mask_nearer_same_traj=True, **kw)[0]
+    loss.backward()
+    assert d.grad[4, 0] == 0.0, "column 0 must not push phi_5 anywhere"
+    assert d.grad[2, 1] != 0.0, "column 1 must still rank phi_3 against its positive"
+    del logits
+
+
+def test_nearer_mask_never_masks_the_positive_and_is_a_noop_at_offset_one():
+    """`goal_step == pos_step` (the sampler drew offset 1, 50% of draws at discount 0.5) has an
+    empty nearer set, so the mask must be inert there and must never remove a positive."""
+    Dist = torch.tensor([[0.0, 3.0], [1.0, 1.0], [3.0, 0.0]])
+    pos_row = torch.tensor([0, 2])
+    kw = dict(
+        row_traj=torch.tensor([0, 0, 1]),
+        row_step=torch.tensor([1, 2, 1]),
+        goal_traj=torch.tensor([0, 1]),
+        goal_step=torch.tensor([1, 1]),           # offset 1 on both columns
+    )
+    masked, info = nce_loss(Dist, pos_row, mask_nearer_same_traj=True, **kw)
+    assert info["nce/negatives_masked"] == 0.0
+    assert torch.allclose(masked, nce_loss(Dist, pos_row)[0])
+
+
+def test_sibling_late_mask_is_narrower_than_the_blunt_same_question_correct_one():
+    """§16.25(a): only a sibling CORRECT trajectory's LATE states, and only against TERMINAL
+    goal columns. Its early states stay -- they are legitimately far and L_T prices them."""
+    R = 6
+    row_traj = torch.tensor([0, 0, 0, 1, 1, 1])       # traj 0 owns the goal, traj 1 is a sibling
+    row_step = torch.tensor([1, 2, 3, 1, 2, 3])
+    row_correct = torch.tensor([True] * 6)
+    row_steps_to_end = torch.tensor([2, 1, 0, 2, 1, 0])
+    SQ = torch.ones(R, 2, dtype=torch.bool)           # one question
+    goal_traj = torch.tensor([0, 0])
+    goal_is_terminal = torch.tensor([True, False])    # column 1 is NOT a terminal
+    Dist = torch.arange(R, dtype=torch.float)[:, None].repeat(1, 2)
+    pos_row = torch.tensor([0, 1])
+
+    _, late = nce_loss(
+        Dist, pos_row, mask_sibling_correct_late=True, sibling_late_margin=1,
+        row_traj=row_traj, goal_traj=goal_traj, row_correct=row_correct,
+        row_steps_to_end=row_steps_to_end, goal_is_terminal=goal_is_terminal, SQ=SQ,
+    )
+    # terminal column masks sibling rows 4 and 5 (steps_to_end <= 1); non-terminal masks none
+    assert late["nce/negatives_masked"] == pytest.approx(1.0)
+
+    _, blunt = nce_loss(
+        Dist, pos_row, mask_same_question_correct=True,
+        row_correct=row_correct, SQ=SQ,
+    )
+    assert blunt["nce/negatives_masked"] > late["nce/negatives_masked"]
+
+
+def test_argmax_in_nearer_set_is_reported_with_every_mask_off():
+    """The §9.9.2 pre-flight. It has to be readable on the CURRENT default config, so it is
+    computed from the raw logits regardless of which masks are enabled."""
+    Dist, pos_row, row_traj, row_step, goal_traj, goal_step = _traj_fixture()
+    # row 0 is nearest everywhere, so both columns' argmax is row 0 -- NOT in the nearer set
+    _, info = nce_loss(
+        Dist, pos_row, row_traj=row_traj, row_step=row_step,
+        goal_traj=goal_traj, goal_step=goal_step,
+    )
+    assert info["nce/negatives_masked"] == 0.0, "diagnostic must not enable any mask"
+    assert info["nce/argmax_in_nearer_set"] == 0.0
+    assert info["nce/columns_with_nearer"] == 1.0
+    assert info["nce/nearer_set_size"] == pytest.approx(2.0)
+
+    # now make phi_6 (a nearer-set row) the closest for both columns
+    D2 = Dist.clone()
+    D2[5] = -5.0
+    _, hit = nce_loss(
+        D2, pos_row, row_traj=row_traj, row_step=row_step,
+        goal_traj=goal_traj, goal_step=goal_step,
+    )
+    assert hit["nce/argmax_in_nearer_set"] == 1.0
+
+
 def test_temperature_is_a_float_knob():
     """tmd.py:92 uses 1/sqrt(512) = 22.6; we use 1.0 (§7.2, bug B10a). Raising tau shrinks
     the logit spread, which is exactly the near-uniform-softmax signature."""

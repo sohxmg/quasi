@@ -181,6 +181,33 @@ def fit_goal_head(model, cache, cfg: Config, device, logger: RunLogger) -> None:
     terminal_question = terminal_question.to(device)
 
     optimizer = torch.optim.AdamW(model.goal_head.parameters(), lr=cfg.goal_head.lr, foreach=False)
+    n_all = terminals.shape[0]
+
+    # ---- HELD-OUT QUESTIONS (added 2026-08-04) --------------------------------------------
+    # `goal/loss` fell 7.469 -> 4.491 over 20 epochs and was STILL FALLING, which is the usual
+    # reason to train longer. It is not a reason on its own: the head is ~1.6M params fitting
+    # one target per question, there was no held-out number, and eval queries questions it has
+    # never seen. Raising `epochs` on a train curve alone is choosing a stopping point on the
+    # only series that cannot tell learning from memorising.
+    #
+    # The split is by QUESTION, not by terminal -- holding out one of a question's terminals
+    # while training on its siblings leaks h_s0 and measures nothing eval cares about. This is
+    # a slice on a cached tensor, so it costs nothing and the training set shrinks by ~6%.
+    n_val_q = int(cfg.goal_head.val_questions)
+    n_q = int(h_s0.shape[0])
+    if n_val_q > 0 and n_q > n_val_q:
+        g = torch.Generator(device="cpu").manual_seed(cfg.run.seed)
+        val_q = torch.randperm(n_q, generator=g)[:n_val_q].to(device)
+        is_val_q = torch.zeros(n_q, dtype=torch.bool, device=device)
+        is_val_q[val_q] = True
+        val_rows = is_val_q[terminal_question]
+    else:
+        val_rows = torch.zeros(n_all, dtype=torch.bool, device=device)
+    train_idx = (~val_rows).nonzero(as_tuple=True)[0]
+    val_idx = val_rows.nonzero(as_tuple=True)[0]
+
+    terminals_val, tq_val = terminals[val_idx], terminal_question[val_idx]
+    terminals, terminal_question = terminals[train_idx], terminal_question[train_idx]
     n = terminals.shape[0]
     if n == 0:
         # The empty cache used to reach the log line below with `info` never assigned and die
@@ -198,7 +225,10 @@ def fit_goal_head(model, cache, cfg: Config, device, logger: RunLogger) -> None:
         "phase2/schedule",
         {
             "questions": int(h_s0.shape[0]),
-            "terminals": n,
+            "terminals": n_all,
+            "terminals_train": n,
+            "terminals_val": int(terminals_val.shape[0]),
+            "val_questions": n_val_q,
             "batch_size": cfg.goal_head.batch_size,
             "batches_per_epoch": batches_per_epoch,
             "epochs": cfg.goal_head.epochs,
@@ -208,6 +238,7 @@ def fit_goal_head(model, cache, cfg: Config, device, logger: RunLogger) -> None:
     )
 
     step = 0
+    best = {"epoch": -1, "val": float("inf")}
     for epoch in range(cfg.goal_head.epochs):
         perm = torch.randperm(n, device=device)
         # Epoch MEANS, weighted by terminals per batch. The last minibatch's `info` was what
@@ -229,6 +260,23 @@ def fit_goal_head(model, cache, cfg: Config, device, logger: RunLogger) -> None:
             for key, value in info.items():
                 totals[key] += value * len(idx)
             seen += len(idx)
+
+        # The number `epochs` should be chosen on. Held-out QUESTIONS, so it is the same
+        # generalisation the eval asks for, and it is one forward over a frozen tensor.
+        val_info: dict[str, float] = {}
+        if terminals_val.shape[0]:
+            with torch.no_grad():
+                _, vi = goal_loss(
+                    model.goal_head(h_s0), terminals_val, tq_val, model.distance
+                )
+            val_info = {
+                "goal/val_loss": vi["goal/loss"],
+                "goal/val_d_pred_to_target": vi["goal/d_pred_to_target"],
+                "goal/val_gap": vi["goal/loss"] - totals["goal/loss"] / seen,
+            }
+            if vi["goal/loss"] < best["val"]:
+                best = {"epoch": epoch, "val": vi["goal/loss"]}
+
         logger.log(
             epoch,
             {
@@ -238,8 +286,25 @@ def fit_goal_head(model, cache, cfg: Config, device, logger: RunLogger) -> None:
                 "goal/terminals_seen": seen,
                 "goal/seconds": time.time() - t0,
                 **{key: total / seen for key, total in totals.items()},
+                **val_info,
             },
             console=True,
+        )
+
+    # NOT early stopping, and deliberately not: the checkpoint saved is the LAST epoch, as it
+    # always was. This only reports where val bottomed, so `epochs` is set from a measurement
+    # instead of from a train curve. If `best_epoch` is far below `epochs - 1`, lower the key.
+    if best["epoch"] >= 0:
+        logger.event(
+            "phase2/val_best",
+            {
+                "best_epoch": best["epoch"],
+                "best_val_loss": best["val"],
+                "epochs_run": cfg.goal_head.epochs,
+                "note": "checkpoint is the LAST epoch, not the best -- set goal_head.epochs "
+                        "to best_epoch + 1 and refit if they differ. Refit is seconds with "
+                        "--from-cache.",
+            },
         )
 
 
@@ -247,12 +312,63 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Feynman-PRM phase 2 (goal head)")
     parser.add_argument("--checkpoint", required=True, help="phase-1 checkpoint directory")
     parser.add_argument("--out", default=None, help="where to write the phase-2 checkpoint")
+    parser.add_argument(
+        "--overwrite", action="store_true",
+        help="discard an existing phase-2 checkpoint at --out. See the guard below.",
+    )
+    parser.add_argument(
+        "--from-cache", action="store_true",
+        help="reuse <out>/cache.pt instead of rebuilding it. The cache is psi(s_T) and h_s0 "
+             "on a FROZEN backbone (locked #15), so it is a pure function of the phase-1 "
+             "checkpoint -- refitting the head at a different `epochs` costs seconds, not the "
+             "~75 min the cache does. Invalid if the phase-1 checkpoint or sequences.parquet "
+             "changed; it is not fingerprinted, so do not reuse one across checkpoints.",
+    )
+    parser.add_argument(
+        "--set", action="append", default=[],
+        help="key.path=value override, as in train.sh. **Phase 2 reads its config from the "
+             "PHASE-1 CHECKPOINT's saved config.yaml, not from config/default.yaml** -- the "
+             "phase-1 config is the one that produced psi and phi, so it has to be. That "
+             "means editing config/default.yaml does NOTHING here, which cost one 20-epoch "
+             "fit on 2026-08-04 that was meant to be 100. Use this flag, e.g. "
+             "--set goal_head.epochs=13.",
+    )
     args = parser.parse_args(argv)
 
     ckpt = Path(args.checkpoint)
     cfg = load_config_from_checkpoint(ckpt)
+    if args.set:
+        from .config import apply_override, config_from_dict
+        import yaml as _yaml
+
+        raw = _yaml.safe_load((ckpt / "config.yaml").read_text())
+        for assignment in args.set:
+            apply_override(raw, assignment)
+        cfg = config_from_dict(raw)
+        print(f"[config] from {ckpt / 'config.yaml'} + {len(args.set)} override(s): "
+              f"{', '.join(args.set)}", flush=True)
+    else:
+        print(f"[config] from {ckpt / 'config.yaml'} "
+              f"(NOT config/default.yaml -- use --set to override; "
+              f"goal_head.epochs = {cfg.goal_head.epochs})", flush=True)
     seed_everything(cfg.run.seed)
     out_dir = Path(args.out) if args.out else ckpt.parent / "phase2"
+
+    # B13/B14's guard, which phase 1 has had since 2026-08-04 and phase 2 never did.
+    # `out_dir` defaults to `<phase-1 run>/phase2`, so a second phase-2 fit on the SAME phase-1
+    # checkpoint silently overwrites the first -- and for `runs/phase1/final` that is the
+    # checkpoint every reported number in the project was measured on (§9.3.1's F1 table, §9.6,
+    # §9.7, §9.8), plus its `deltas.npz` and the `gate_before_fit` event. A different phase-1
+    # run writes to its own directory and never collides; the hazard is refitting the same one.
+    # Keyed on `heads.pt` per B14 -- `config.yaml` is a sidecar that proves nothing was trained.
+    existing = out_dir / "final" / "heads.pt"
+    if existing.exists() and not args.overwrite:
+        raise SystemExit(
+            f"\n{out_dir / 'final'} already holds a trained goal head ({existing}).\n"
+            f"Refitting would overwrite it, and for runs/phase1 that is the checkpoint every\n"
+            f"reported number was measured on. Pass --out <somewhere else>, or --overwrite if\n"
+            f"discarding it is really the intent.\n"
+        )
     logger = RunLogger(out_dir.parent, out_dir.name, cfg.log.wandb, cfg.log.wandb_project, cfg.to_dict())
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -284,18 +400,28 @@ def main(argv: list[str] | None = None) -> int:
 
     # ~300k rows rebuilt into SequenceRow objects one at a time: a minute of silence on its
     # own, before the backbone has done anything.
-    parquet = Path(cfg.data.dir) / "sequences.parquet"
-    print(f"[cache] reading {parquet} (train split)...", flush=True)
-    t_read = time.time()
-    rows = read_sequences_parquet(parquet, split="train")
-    print(f"[cache] read {len(rows):,} rows in {time.time() - t_read:.1f}s", flush=True)
+    cache_path = out_dir / "cache.pt"
+    if args.from_cache:
+        if not cache_path.exists():
+            raise SystemExit(f"--from-cache: no cache at {cache_path}")
+        blob = torch.load(cache_path, map_location="cpu")
+        cache = (blob["h_s0"], blob["terminals"], blob["terminal_question"], blob["qids"])
+        print(f"[cache] reused {cache_path} "
+              f"({cache[0].shape[0]:,} questions, {cache[1].shape[0]:,} terminals)", flush=True)
+    else:
+        parquet = Path(cfg.data.dir) / "sequences.parquet"
+        print(f"[cache] reading {parquet} (train split)...", flush=True)
+        t_read = time.time()
+        rows = read_sequences_parquet(parquet, split="train")
+        print(f"[cache] read {len(rows):,} rows in {time.time() - t_read:.1f}s", flush=True)
 
-    cache = build_cache(model, tokenizer, rows, cfg, device)
-    torch.save(
-        {"h_s0": cache[0], "terminals": cache[1], "terminal_question": cache[2], "qids": cache[3]},
-        out_dir / "cache.pt",
-    )
-    print(f"[cache] wrote {out_dir / 'cache.pt'}", flush=True)
+        cache = build_cache(model, tokenizer, rows, cfg, device)
+        torch.save(
+            {"h_s0": cache[0], "terminals": cache[1],
+             "terminal_question": cache[2], "qids": cache[3]},
+            cache_path,
+        )
+        print(f"[cache] wrote {cache_path}", flush=True)
 
     psi_t, qidx = gate_subsample(cache[1], cache[2])
     gate = terminal_spread_ratio(psi_t.to(device), qidx.to(device), model.distance)
