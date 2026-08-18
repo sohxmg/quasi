@@ -1,0 +1,116 @@
+run:
+  name: phase1_cf_term_taucf01
+  out_dir: runs
+  seed: 42
+model:
+  name: Qwen/Qwen2.5-Math-1.5B-Instruct
+  lora:
+    r: 16
+    alpha: 16
+    dropout: 0.0
+  gradient_checkpointing: true
+  attn_implementation: sdpa
+heads:
+  latent_dim: 512
+  hidden_dims:
+  - 512
+  - 512
+  - 512
+  ensemble: false
+  action_pool: mean
+distance:
+  variant: full_mrn
+  components: 8
+data:
+  dir: data/processed
+  max_len: 1024
+  sep_token: '
+
+    '
+  prompt_format: raw
+  n_questions: 34650
+  n_val_questions: 2000
+  cf_glob: data/cf_train/cf70k.jsonl,data/cf_train/cf70k_gm.jsonl,data/cf_train/cf70k_oai.jsonl
+  cf_max_per_batch: 12
+discount: 0.5
+sampling:
+  sequences_per_micro_batch: 56
+  max_padded_tokens: 32768
+  max_correct_per_question: 4
+  max_incorrect_per_question: 3
+  nce_mask_same_traj: false
+  nce_mask_nearer_same_traj: true
+  nce_mask_same_question_correct: false
+  nce_mask_sibling_correct_late: false
+  nce_sibling_late_margin: 1
+  group_by_length: true
+losses:
+  lambda_nce: 1.0
+  lambda_i: 1.0
+  zeta: 0.2
+  lambda_cf: 1.0
+  lambda_step: 1.0
+  lambda_good: 1.0
+  lambda_term: 1.0
+  lambda_term_temperature: 1.0
+  lambda_cf_temperature: 0.1
+  nce_temperature: 22.627417
+  action_invariance:
+    mode: diagonal
+  step_loss:
+    margin_steps: 2.0
+    pairing: boundary
+    exclude_recovery: false
+  good_loss:
+    margin_steps: 1.0
+    form: relu_squared
+    include_incorrect_prefix: true
+    detach_goal: false
+    warmup_steps: 100
+  backup:
+    clip_t_gain: 20.0
+    diag_backup: 0.5
+    goal_scope_ratio: 1.0
+    stopgrad_psi_backup: false
+  stopgrad_phi_invariance: false
+train:
+  epochs: 1
+  grad_accum: 2
+  lr_backbone: 9.0e-06
+  lr_heads: 0.0003
+  schedule: cosine
+  warmup_ratio: 0.03
+  betas:
+  - 0.9
+  - 0.95
+  weight_decay: 0.0
+  bf16: true
+  grad_clip: 1.0
+  log_every: 10
+  save_every: 250
+  max_steps: null
+goal_head:
+  lr: 0.001
+  epochs: 90
+  batch_size: 512
+  max_terminals_per_question: 8
+  val_questions: 2000
+eval:
+  subsets:
+  - gsm8k
+  - math
+  - olympiadbench
+  - omnimath
+  max_len: 2048
+  batch_sequences: 16
+  skyline: true
+  localisation_rule: first_crossing
+log:
+  wandb: true
+  wandb_project: feynman-prm
+_derived:
+  neg_log_gamma: 0.6931471805599453
+  step_margin: 1.3862943611198906
+  good_margin: -0.6931471805599453
+  clip_t: 3.6888794541139363
+  backup_gain: 20.0
