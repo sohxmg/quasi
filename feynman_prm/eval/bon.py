@@ -192,11 +192,14 @@ def load_candidates(
                 f"  candidates: {row['question'][:120]!r}\n  reference:  {gold[gold_key][:120]!r}"
             )
         responses = row["responses"][:max_candidates]
-        if len(responses) < max(SAMPLE_NUMS):
+        if len(responses) < max_candidates:
             raise AssertionError(
-                f"{data_file}: question {idx} has {len(responses)} responses, and the ladder "
-                f"tops out at {max(SAMPLE_NUMS)}. A short question would make best_of_128 a "
-                "best_of_fewer and quietly flatter the model."
+                f"{data_file}: question {idx} has {len(responses)} responses but "
+                f"{max_candidates} were asked for. A short question would make best_of_N a "
+                "best_of_fewer and quietly flatter the model. Note the check is against what "
+                "was REQUESTED (--max-n), not against max(SAMPLE_NUMS): deliberately scoring "
+                "a truncated pool is legal and exact (see `take_first_n`), silently getting "
+                "one is not."
             )
         group = []
         for rank, response in enumerate(responses):
@@ -721,6 +724,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--step-numbering", default="one_based",
                         choices=["one_based", "crm_verbatim"])
+    parser.add_argument(
+        "--max-n", type=int, default=max(SAMPLE_NUMS),
+        help="score only the first N candidates per question, and report the rungs of the "
+             "ladder at or below N. **The retained rungs are EXACT, not subsampled.** The "
+             "ladder is nested -- `take_first_n` takes the first n in file order, because "
+             "CRM's split_query sorts on a constant -- so the first 16 candidates determine "
+             "best_of_8 and best_of_16 completely, whether or not the other 112 were ever "
+             "scored. Cost is linear in this: --max-n 16 is one eighth of the GPU time of the "
+             "full 128 and loses only the upper rungs, where BoN gains are largest. Question "
+             "counts are untouched, so no sampling noise is introduced.",
+    )
     parser.add_argument("--max-len", type=int, default=None,
                         help="default cfg.eval.max_len. Over-length candidates score -inf, "
                              "they are never dropped -- dropping would change N.")
@@ -760,7 +774,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"tau = {tau:.4f} (from {tau_source}); max_len = {max_len}", flush=True)
 
     reference = load_reference_dataset(args.data_name, args.gsm8k_reference, args.math_reference)
-    pool = load_candidates(args.data_file, args.data_name, reference, args.step_numbering)
+    if args.max_n > max(SAMPLE_NUMS):
+        parser.error(f"--max-n {args.max_n} exceeds the ladder's top rung {max(SAMPLE_NUMS)}")
+    pool = load_candidates(
+        args.data_file, args.data_name, reference, args.step_numbering,
+        max_candidates=args.max_n,
+    )
     n_candidates = len(pool[0])
     print(f"{args.data_file}: {len(pool)} questions x {n_candidates} candidates", flush=True)
 
@@ -774,7 +793,10 @@ def main(argv: list[str] | None = None) -> int:
         "tau_source": tau_source,
         "step_numbering": args.step_numbering,
         "max_len": max_len,
-        "sample_nums": list(SAMPLE_NUMS),
+        "sample_nums": [n for n in SAMPLE_NUMS if n <= args.max_n],
+        "max_n": args.max_n,
+        # Recorded so a partial run can never be mistaken for a full one in the write-up.
+        "ladder_truncated": args.max_n < max(SAMPLE_NUMS),
         # Recorded per run, not assumed: it is the one environment fact that silently moves a
         # math number without moving anything the model did.
         "latex_parser_available": latex_parser_available(),

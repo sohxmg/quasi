@@ -341,8 +341,43 @@ def test_short_pool_is_rejected_rather_than_silently_becoming_best_of_fewer(tmp_
     payload = json.loads(path.read_text())
     payload[1]["responses"] = payload[1]["responses"][:100]
     path.write_text(json.dumps(payload))
-    with pytest.raises(AssertionError, match="ladder tops out"):
+    with pytest.raises(AssertionError, match="were asked for"):
         load_candidates(path, "gsm8k", reference)
+
+
+def test_max_n_truncation_is_exact_not_approximate(tmp_path):
+    """The load-bearing property behind `--max-n`: scoring only the first N candidates gives
+    the SAME best_of_k for every k <= N as scoring the whole pool would.
+
+    This is what makes a short run a real result rather than a preview. It holds because the
+    ladder is nested -- CRM's `split_query` sorts on a constant `logprobs`, so `take_first_n`
+    is file order -- and it is asserted rather than assumed because the entire argument for
+    running at --max-n 16 collapses if it is false.
+    """
+    import numpy as np
+
+    from feynman_prm.eval.bon import best_of_n, take_first_n
+
+    rng = np.random.default_rng(0)
+    full = rng.normal(size=(40, 128))
+    for n in (8, 16):
+        truncated = full[:, :16]
+        assert np.array_equal(best_of_n(full, n), best_of_n(truncated, n))
+        assert take_first_n(n, 128) == take_first_n(n, 16)
+
+
+def test_max_n_rejects_a_pool_shorter_than_requested(tmp_path):
+    """--max-n 16 against a file with 10 responses must still fail: asking for a truncated
+    pool is legal, silently receiving one is not."""
+    from feynman_prm.eval.bon import load_candidates
+
+    path, reference = build_fixture(tmp_path)
+    payload = json.loads(path.read_text())
+    n_have = len(payload[1]["responses"])
+    payload[1]["responses"] = payload[1]["responses"][: n_have - 1]
+    path.write_text(json.dumps(payload))
+    with pytest.raises(AssertionError, match="were asked for"):
+        load_candidates(path, "gsm8k", reference, max_candidates=n_have)
 
 
 def test_end_to_end_table_on_a_fixture_with_a_known_answer(tmp_path):

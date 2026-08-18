@@ -33,6 +33,15 @@ shift || true
 
 DATA_DIR="${DATA_DIR:-eval_data}"
 OUTPUT_DIR="${OUTPUT_DIR:-${CHECKPOINT}/bon}"
+# Score only the first MAX_N candidates per question. The ladder is nested, so the rungs at or
+# below MAX_N come out EXACT -- this trades the top of the ladder for GPU time, and trades
+# nothing else. Cost is linear: MAX_N=16 is one eighth of MAX_N=128. Full run is 128.
+MAX_N="${MAX_N:-128}"
+# Aggregator: 'auto' re-fits the choice on Math-Shepherd val ONCE PER FILE, and picks the same
+# winner every time (same model, same val split, same tau). Set AGGREGATOR to the name the
+# first file chose to skip the other three passes.
+AGGREGATOR="${AGGREGATOR:-auto}"
+BATCH_SEQUENCES="${BATCH_SEQUENCES:-64}"
 GSM8K_REFERENCE="${GSM8K_REFERENCE:-qintongli/GSM-Plus}"
 MATH_REFERENCE="${MATH_REFERENCE:-}"
 
@@ -71,6 +80,9 @@ for FILE in "${FILES[@]}"; do
         --data-file "${DATA_FILE}" \
         --save-file "${OUTPUT_DIR}/bon_${FILE%.json}.json" \
         --gsm8k-reference "${GSM8K_REFERENCE}" \
+        --max-n "${MAX_N}" \
+        --aggregator "${AGGREGATOR}" \
+        --batch-sequences "${BATCH_SEQUENCES}" \
         ${MATH_REFERENCE:+--math-reference "${MATH_REFERENCE}"} \
         "${EXTRA[@]}" "$@"
 done
