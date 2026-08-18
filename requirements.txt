@@ -4,6 +4,11 @@ torch>=2.8              # install from the cu128 index: REQUIRED for sm_120 (Bla
 transformers>=4.56      # dtype= kwarg; torch_dtype= is deprecated and goes away in v5
 peft>=0.14
 datasets>=3.5
+huggingface_hub         # arrives transitively with transformers/datasets, but pinned
+                        # here because scripts/fetch_bon_data.sh imports it DIRECTLY to
+                        # pull PQM's 451 MB BoN corpus, which .gitignore keeps out of
+                        # git. A transitive dep that a script calls by name is a
+                        # direct dep.
 accelerate>=1.4
 pyyaml
 numpy

@@ -42,3 +42,13 @@ data/cf_train/*
 !data/cf_train/MANIFEST.md
 wandb/
 secret.txt
+# PQM's Best-of-N candidate corpus, fetched by scripts/fetch_bon_data.sh (2026-08-18).
+# 451 MB in four files and TWO OF THEM ARE OVER GITHUB'S 100 MB HARD BLOCK on their own
+# (gsm8k-plus-metamath-mistral 186 MB, gsm8k-plus-muggle 163 MB), so this is not a size
+# preference like data/cf_train/ above -- a push carrying them is rejected, full stop.
+#
+# It is also not our data: it is PQM's published test corpus (arXiv:2410.11287), reused
+# unmodified so our BoN numbers are comparable with CRM's. Committing someone else's
+# published 451 MB to get a fetch we can do in one command is the wrong trade; the fetcher
+# is in git instead, and it pins the same four filenames the eval expects.
+eval_data/

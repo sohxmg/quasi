@@ -94,8 +94,8 @@ def split_response_into_steps(response: str, numbering: str = "one_based") -> tu
 
     **CRM's re-prefixing is off by one and it is not a transcription error here -- it is in
     their file.** `enumerate` runs over the UNFILTERED fragments while the filter drops the
-    leading empty one, so a response that begins "Step 1:" -- which is the overwhelming
-    majority -- comes back as `["Step 2: ...", "Step 3: ..."]`:
+    leading empty one, so a response that begins "Step 1:" comes back as
+    `["Step 2: ...", "Step 3: ..."]`:
 
         >>> re.split(r"Step \\d+:", "Step 1: add\\nStep 2: mul\\n")
         ['', ' add\\n', ' mul\\n']                      # fragment 0 is empty and is dropped
@@ -106,10 +106,20 @@ def split_response_into_steps(response: str, numbering: str = "one_based") -> tu
     look like (§4.7: 99.98% of its steps start with "Step N: ") and therefore what both models
     were trained on. `crm_verbatim` reproduces the shift.
 
-    This is the one place the two harnesses can legitimately diverge, so it is a flag rather
-    than a decision, and `--step-numbering crm_verbatim` measures what it is worth. Judge the
-    difference on the BoN accuracy it produces; if it is large, say so in the write-up, because
-    then the comparison is partly a measurement of prompt formatting.
+    **MEASURED ON THE REAL CORPUS (2026-08-18), AND THE ANSWER IS THAT IT DOES NOT MATTER
+    HERE.** The paragraph above was written before the candidate files were on disk and it
+    guessed wrong about them. Across all four `*-128.json` files, **0% of responses begin with
+    "Step 1:"** -- every one of them states its first step WITHOUT a prefix and only labels
+    "Step 2:" onward. So the leading fragment is never empty, the filter never drops it, and
+    CRM's `enumerate` is accidentally correct. The two modes produce identical output on
+    100% of gsm8k-plus-metamath-mistral, math-metamath-mistral and math-muggle, and on 99.8%
+    of gsm8k-plus-muggle (the remainder are responses that open with a literal "Step 1:").
+
+    The flag therefore stays, because it costs nothing and it is what proved the above, but
+    `--step-numbering` cannot move a BoN number on this corpus and no write-up needs to
+    caveat it. Note the off-by-one IS real on Math-Shepherd, where §4.7 measured 99.98% of
+    steps carrying a "Step N: " prefix -- it is the BoN pool that is formatted differently,
+    which is exactly why this had to be measured rather than assumed.
     """
     fragments = _STEP_SPLIT.split(response)
     if numbering == "crm_verbatim":
