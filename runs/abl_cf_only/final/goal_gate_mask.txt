@@ -1,0 +1,53 @@
+Loading weights:   0%|          | 0/338 [00:00<?, ?it/s]Loading weights: 100%|██████████| 338/338 [00:00<00:00, 5907.99it/s]
+{
+  "population": {
+    "rows_total": 525,
+    "rows_kept": 525,
+    "rows_unmaskable": 0,
+    "rows_lost_with_their_question": 0,
+    "questions_total": 200,
+    "questions_kept": 200
+  },
+  "unmasked": {
+    "gate/within_question_terminal_spread": 0.5937882661819458,
+    "gate/across_question_terminal_spread": 1.0103923082351685,
+    "gate/ratio": 0.5876809050725095,
+    "gate/auc": 0.7072884440422058,
+    "gate/recall_at_1": 0.32380953431129456,
+    "gate/questions_fully_clustered": 0.06499999761581421,
+    "gate/questions_fully_scattered": 0.5249999761581421,
+    "gate/per_question_recall_std": 0.3281567692756653,
+    "gate/within_pairs": 1002,
+    "gate/across_pairs": 274098,
+    "gate/questions": 200,
+    "gate/terminals": 525,
+    "gate/untrained_baseline": false
+  },
+  "masked": {
+    "gate/within_question_terminal_spread": 0.5172499418258667,
+    "gate/across_question_terminal_spread": 0.8144257664680481,
+    "gate/ratio": 0.6351099917541222,
+    "gate/auc": 0.6587681770324707,
+    "gate/recall_at_1": 0.21523809432983398,
+    "gate/questions_fully_clustered": 0.029999999329447746,
+    "gate/questions_fully_scattered": 0.6449999809265137,
+    "gate/per_question_recall_std": 0.27277570962905884,
+    "gate/within_pairs": 1002,
+    "gate/across_pairs": 274098,
+    "gate/questions": 200,
+    "gate/terminals": 525,
+    "gate/untrained_baseline": false
+  },
+  "delta": {
+    "gate/auc": -0.04852026700973511,
+    "gate/recall_at_1": -0.10857143998146057,
+    "gate/ratio": 0.04742908668161272
+  }
+}
+
+recall@1  unmasked 0.324  ->  masked 0.215   (66.5% retained)
+auc       unmasked 0.707  ->  masked 0.659
+
+525 of 525 rows over 200 of 200 questions; 0 unmaskable, 0 lost with their question.
+
+WHAT THIS DOES AND DOES NOT SAY (§7.13.1). It measures how much of the same-question terminal structure survives deleting the printed answer from the INPUT -- i.e. whether the encoder took the shortcut, not whether the shortcut was available. Availability is `scripts/terminal_shortcut.py`, it is 0.927 against a chance of 0.500, and it does not depend on any checkpoint. Report the pair; a lambda_term > 0 run that improves recall@1 has two explanations and only this separates them. There is NO threshold here on purpose -- print the ratio and let the reader judge (§14, B12: a guard that renders a verdict can render the wrong one).
