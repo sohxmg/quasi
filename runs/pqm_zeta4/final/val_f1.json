@@ -1,0 +1,12 @@
+{
+  "checkpoint": "runs/pqm_zeta4/final",
+  "trajectories": 18220,
+  "questions": 1999,
+  "calibration/tau": 1.9259832394123073,
+  "calibration/f1": 0.5766405519829827,
+  "calibration/acc_error": 0.5375113533151681,
+  "calibration/acc_correct": 0.6219140083217753,
+  "calibration/expected_tau": 2.0,
+  "calibration/sensitivity": 0.001012862864027686,
+  "note": "The Math-Shepherd val F1. The COMPARABLE Feynman number is the goal-head `calibration/f1` in that run's phase2/final/processbench.json (0.5900 for abl_cf_only, 0.5872 for phase1_nce_temp_relu2) -- NOT scripts/val_f1.py's 0.5615, which substitutes a real terminal for the goal and is a ceiling by its own docstring (\u00a79.5)."
+}
