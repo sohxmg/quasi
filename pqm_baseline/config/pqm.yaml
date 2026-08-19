@@ -1,0 +1,49 @@
+# PQM's own knobs, and NOTHING else. Everything shared with Feynman-PRM -- dataset,
+# selection, seed, batch stream, tokenisation, backbone, LoRA, optimiser, schedule, eval
+# protocol -- comes from `config/default.yaml` UNCHANGED, which is what makes the two rows
+# of the paper's table differ in exactly the head and the objective.
+#
+# Strict-parsed (pqm_baseline/config.py): an unknown or misspelled key is a HARD ERROR.
+#
+#   python -m pqm_baseline.train --set run.name=pqm_zeta4
+#   python -m pqm_baseline.train --set run.name=pqm_zeta8 --set pqm.zeta=8
+#
+# `run.name` comes through `--set`, so `config/default.yaml` is never edited for this run.
+
+zeta: 4                 # PQM's default (train_main.py:181). The negative offset: negatives
+                        # are scored exp(r + zeta) against the positives' exp(r), so the loss
+                        # drives negatives below -zeta and positives above 0. Those two
+                        # ABSOLUTE anchors are what make a single global tau meaningful.
+                        #
+                        # NOT `losses.zeta` in config/default.yaml -- that is Feynman's (3)
+                        # L_T backup weight (0.05/0.1) and the two have nothing to do with
+                        # each other. train.py prints both at launch.
+                        #
+                        # zeta = 4 was chosen on a 7B FULL finetune; this is a 1.5B LoRA. A
+                        # sweep was offered and declined. If the number looks bad,
+                        # `--set pqm.zeta=...` is a one-line re-run and it is the first thing
+                        # to try before drawing a conclusion.
+
+loss_type: rank         # PQM's default and the paper's method (train_main.py:182-183). The
+                        # pointwise variants (orm/mse/bce) are a different objective and are
+                        # not ported -- config.py rejects them rather than silently ignoring.
+
+head_dropout: 0.1       # value_model.py:27-33. Qwen2's config carries no
+                        # `summary_dropout_prob`, so TRL's own default 0.1 applies -- the
+                        # same value PQM trained deepseek-math-7b-base under.
+
+head_init: zero         # zero | default. `zero` makes the init loss CLOSED-FORM, so the
+                        # launch check is an exact assert rather than an eyeball (§18: an
+                        # ASSUMED init value is how two regressions got through). It also
+                        # removes an exp(r + zeta) overflow risk -- Qwen's massive-activation
+                        # channels run O(100), and fp32 exp overflows above r ~= 84.
+                        # `default` reproduces PQM's plain nn.Linear init; if you select it,
+                        # read `pqm/reward_max` in `launch/init_values` before walking away.
+
+label_source: from_z    # from_z | raw. `from_z` derives step labels from the parquet's `z`
+                        # (label_k = z == -1 or k < z) -- the parquet stores `z`, not the
+                        # label vector, and this is exactly how Feynman's (5)/(6) treat the
+                        # same trajectories (§16.15). It monotonises the 1.48% of
+                        # trajectories with a False -> True recovery. `raw` is REFUSED: it
+                        # needs a `labels` column that sequences.parquet does not carry, and
+                        # adding it changes a SHARED artifact for a 1.48% effect. README.md.

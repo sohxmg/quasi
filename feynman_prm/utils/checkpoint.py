@@ -23,11 +23,23 @@ import torch
 HEAD_PREFIXES = ("psi.", "phi.", "goal_head.", "action_pool.", "distance.")
 
 
-def head_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+def head_state_dict(
+    model: torch.nn.Module, prefixes: tuple[str, ...] = HEAD_PREFIXES
+) -> dict[str, torch.Tensor]:
+    """`prefixes` names which parameters are "the heads" for this model.
+
+    It exists for exactly one caller and it is additive: `pqm_baseline/` trains
+    {LoRA, value_head} and has no psi/phi at all, so it saves through THIS asserted path --
+    §14's LoRA trap 3 is that the stock PEFT save writes the adapter and silently drops the
+    trained head, and duplicating the save to dodge a default would duplicate the trap with
+    it. The string `"value_head."` is passed by the caller and never appears in
+    `feynman_prm/`, which is what keeps
+    `tests/test_grep_invariants.py::test_no_value_head_anywhere` honest.
+    """
     return {
         name: tensor.detach().cpu()
         for name, tensor in model.state_dict().items()
-        if name.startswith(HEAD_PREFIXES)
+        if name.startswith(prefixes)
     }
 
 
@@ -38,15 +50,19 @@ def save_checkpoint(
     tokenizer=None,
     step: Optional[int] = None,
     extra: Optional[dict[str, Any]] = None,
+    prefixes: tuple[str, ...] = HEAD_PREFIXES,
 ) -> Path:
+    """`prefixes` defaults to `HEAD_PREFIXES`, so every existing call is unchanged. See
+    `head_state_dict` for the one caller that passes it."""
     path = Path(out_dir)
     path.mkdir(parents=True, exist_ok=True)
 
-    heads = head_state_dict(model)
+    heads = head_state_dict(model, prefixes)
     if not heads:
         raise AssertionError(
-            "head state dict is EMPTY -- this is the exact failure §14 records (the stock "
-            "PEFT save path writes the adapter only and silently drops the trained heads)"
+            f"head state dict is EMPTY at prefixes {prefixes} -- this is the exact failure "
+            "§14 records (the stock PEFT save path writes the adapter only and silently "
+            "drops the trained heads)"
         )
     torch.save({"heads": heads, "step": step, **(extra or {})}, path / "heads.pt")
 
