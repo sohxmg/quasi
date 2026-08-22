@@ -84,7 +84,15 @@ class RunLogger:
                 ) from exc
 
             self._wandb = wandb
-            wandb.init(project=wandb_project, name=run_name, config=dict(config or {}))
+            run = wandb.init(project=wandb_project, name=run_name, config=dict(config or {}))
+            # The dashboard URL is printed by wandb itself and then scrolls past. On a rented
+            # box the console is a log stream you may not be watching, so persist it: it is
+            # the only pointer from an artifact directory back to the live curves.
+            url = getattr(run, "url", None)
+            if url:
+                self._events.write(json.dumps({"event": "wandb/run", "url": url}) + "\n")
+                self._events.flush()
+                print(f"[wandb/run] {url}", flush=True)
 
     # ---- writing ----
 
