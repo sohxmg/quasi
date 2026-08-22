@@ -22,6 +22,27 @@ lambda are the same knob (gradient ~ lambda/tau), so the EFFECTIVE weight on (4)
 as saturating. THE TELL IS `cf/loss - cf/chance`, never raw `cf/loss`: near -0.02 the
 change did nothing, -1.09 or beyond means tau overshot and 0.2 is the fallback.
 
+## This run was RESUMED, and `abl_cf_only` was not
+
+The first attempt died at step 990 of 1,464 when the Modal client cancelled the call
+(`.remote()` binds a call to the client session; the launcher now uses `.spawn()`).
+Steps 751-1464 were re-run from `step750` with `train.py --resume`, added for this.
+
+Restored exactly: the weights, the LR (`build_scheduler` replayed over the FULL 1,464-step
+cosine, so step 751 opened on 4.539822e-06 -- the value `metrics.jsonl` logged at 750, to
+its full recorded precision), and the data position (`epoch_batches` is seeded off
+`run.seed` alone, so the run consumed `batches[1500:]`, precisely the micro-batches step750
+never saw).
+
+NOT restored: AdamW's moments, which are not in a checkpoint and restarted at zero.
+`betas[1] = 0.95` bounds that -- a ~14-step second-moment half-life against 714 remaining
+steps -- and the measured transient is nil: `nce/loss - nce/chance` was -0.0139 over steps
+700-750 (before the kill) and -0.0134 over 760-790 (after the resume), improving
+monotonically to -0.0204 by the end. No bump is visible in any curve.
+
+It is recorded anyway because the comparison run has no such discontinuity, and a
+difference between two runs being compared is not the reader's to rediscover.
+
 ## Phase-1 ceiling (held-out Math-Shepherd val)
 
 - val F1 at best tau: **0.5636827260156378**  (tau = 0.2676096643209447)

@@ -263,7 +263,8 @@ def commit_and_push(dest_root: Path, summary: dict) -> bool:
         val = summary.get("val_f1_at_best_tau")
         msg = (
             f"{RUN_NAME}: ProcessBench mean F1 {f1}, phase-1 val F1 {val}\n\n"
-            "zeta=0.2, nce_temperature=4.0, nce_mask_sibling_correct_late=true.\n"
+            "zeta=0.2, nce_temperature=22.627417, lambda_cf=2.0, "
+            "lambda_cf_temperature=0.05, lambda_term=0.0.\n"
             "Ran on a Modal A100 40 GB at PROFILE=match. Analysis files only -- the\n"
             "adapters, heads and phase2/cache.pt stayed on the fetching machine.\n"
         )
