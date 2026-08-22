@@ -61,6 +61,8 @@ import modal
 
 APP_NAME = "feynman-cf-lam2-tau005"
 RUN_NAME = "cf_lam2_tau005"
+# Where .spawn()'s FunctionCall id is recorded, so the run is reachable from any shell.
+CALL_ID_FILE = "logs/cf_lam2_tau005.call_id"
 
 LOCAL_REPO = Path(__file__).parent.resolve()
 REPO = "/root/quasi"
@@ -75,6 +77,33 @@ TRAIN_ARGS = [
     "--set", "losses.lambda_cf_temperature=0.05",
     "--set", f"run.name={RUN_NAME}",
 ]
+
+# ---------------------------------------------------------------------------------------
+# RESUME. Set to None for a clean run from step 0.
+# ---------------------------------------------------------------------------------------
+#
+# The first attempt at this run reached step 990 of 1,464 before `.remote()` let the client
+# cancel it (see the entrypoint). `save_every` is 250, so step750 is the furthest checkpoint on
+# the volume and 240 steps of that work are unrecoverable -- but 750 are not, and re-buying them
+# is ~2.1 h of A100 for a curve that already exists.
+#
+# `--resume` restores three of the four pieces of state EXACTLY: the weights come off the
+# checkpoint, the LR is replayed through the FULL 1,464-step cosine so step 751 opens on the
+# same 4.539822e-06 the original run logged at 750, and the batch order is a pure function of
+# `run.seed`, so the run consumes `batches[1500:]` -- precisely the micro-batches step750 never
+# saw, with `goal_rng` keyed on (seed, epoch, micro) so each survivor is bit-identical.
+#
+# The fourth piece, Adam's moments, is not in the checkpoint and restarts at zero. `betas` is
+# [0.9, 0.95], a ~14-step second-moment half-life, so the transient is re-converged inside ~40
+# of the 714 remaining steps. `tests/test_resume.py` asserts that ratio and fails if a future
+# beta2 makes the resume indefensible. Expect a small bump in the curves around step 750-790 in
+# wandb; that is the moment reset and not the loss set.
+#
+# The resulting run is therefore comparable to `runs/abl_cf_only` on everything except a ~40
+# step window, which is the honest caveat to attach to the ProcessBench number.
+RESUME_FROM = f"runs/{RUN_NAME}/step750"
+
+TRAIN_ARGS_EFFECTIVE = TRAIN_ARGS + (["--resume", RESUME_FROM] if RESUME_FROM else [])
 
 # Not a "did it improve" threshold -- a "did the geometry learn correctness at all" floor.
 # Under it, phase 2 and ProcessBench are wasted GPU time (scripts/val_f1.py's docstring).
@@ -294,7 +323,15 @@ def train_and_eval(skip_phase2_below: float = SKIP_PHASE2_BELOW) -> dict:
             summary["stages"]["train"] = "skipped (already done)"
         else:
             t0 = time.time()
-            _run(["bash", "scripts/train_cloud.sh", *TRAIN_ARGS], "1/train_cloud")
+            if RESUME_FROM and not (root / RESUME_FROM / "heads.pt").exists():
+                # Fail here rather than let train.py's SystemExit surface as a generic stage
+                # failure four minutes into a paid container: if the checkpoint is not on the
+                # volume, the intended run is not the run that would happen.
+                raise RuntimeError(
+                    f"RESUME_FROM={RESUME_FROM} has no heads.pt on the volume. Either the "
+                    f"checkpoint was deleted, or set RESUME_FROM=None for a clean run."
+                )
+            _run(["bash", "scripts/train_cloud.sh", *TRAIN_ARGS_EFFECTIVE], "1/train_cloud")
             summary["stages"]["train"] = round((time.time() - t0) / 3600, 2)
             runs_vol.commit()
 
@@ -396,7 +433,15 @@ def main(skip_phase2_below: float = SKIP_PHASE2_BELOW):
     print(f"    selection ok: {selection.get('selection_sha_train')}")
 
     print("\n=== stages 1-4: train + ProcessBench (A100 40 GB, ~4.2 h) ===")
-    summary = train_and_eval.remote(skip_phase2_below=skip_phase2_below)
-    print("\n=== summary ===")
-    print(json.dumps(summary, indent=2))
-    print("\nNow run:  python modal_nce1_masked_finish.py")
+    # .spawn(), NOT .remote(). The first attempt at this run died at step 990 because
+    # `.remote()` keeps the call bound to the client session: when that client went away
+    # Modal logged `Successfully canceled input` and stopped the app. `--detach` does NOT
+    # cover that -- it protects against the parent being KILLED, not against the client
+    # cancelling on a graceful shutdown. `.spawn()` is fire-and-forget: it hands back a
+    # FunctionCall and leaves the work running server-side with nothing able to cancel it.
+    call = train_and_eval.spawn(skip_phase2_below=skip_phase2_below)
+    Path(CALL_ID_FILE).parent.mkdir(parents=True, exist_ok=True)
+    Path(CALL_ID_FILE).write_text(call.object_id + "\n")
+    print(f"    spawned: {call.object_id}  (written to {CALL_ID_FILE})")
+    print("\nThis client is free to exit; the run does not depend on it.")
+    print("    collect: python modal_cf_lam2_tau005_finish.py")

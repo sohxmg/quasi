@@ -168,6 +168,45 @@ def arm_gradient_checkpointing(model: torch.nn.Module) -> int:
     return len(layers)
 
 
+def load_backbone_resume(cfg: Config, adapter_dir):
+    """Reload a phase-1 backbone from a saved adapter, TRAINABLE, for --resume.
+
+    Deliberately not a flag on `load_backbone_with_adapter`: that one exists for phase 2 and
+    eval, where frozen-and-eval is the correctness requirement, and a `trainable=True` branch
+    through it would put "the backbone silently kept training" one wrong keyword away from
+    every downstream consumer. The two paths want opposite things from the same directory.
+
+    What this must match is `load_backbone`, not the eval loader: same dtype, same
+    `model.train()`, same gradient-checkpointing arming. `is_trainable=True` is what makes
+    PEFT leave `requires_grad` on the LoRA matrices -- without it `from_pretrained` freezes
+    them and `assert_phase1_trainable` fails with an empty `lora` bucket, which is the
+    informative failure and the reason that assert runs on the resumed model too.
+
+    The LoRA hyperparameters (r, alpha, dropout, target modules) come from the checkpoint's own
+    `adapter_config.json`, NOT from cfg -- so a resume whose config disagrees with the saved
+    adapter loads the SAVED geometry. train.py checks that agreement explicitly rather than
+    letting the shapes decide it silently.
+    """
+    from peft import PeftModel
+    from transformers import AutoModel
+
+    dtype = torch.bfloat16 if cfg.train.bf16 else torch.float32
+    base = AutoModel.from_pretrained(
+        cfg.model.name, dtype=dtype, attn_implementation=cfg.model.attn_implementation
+    )
+    model = PeftModel.from_pretrained(base, str(adapter_dir), is_trainable=True)
+
+    if cfg.model.gradient_checkpointing:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.enable_input_require_grads()
+
+    model.train()   # before arm_gradient_checkpointing: it raises on layers left in eval mode
+
+    if cfg.model.gradient_checkpointing:
+        arm_gradient_checkpointing(model)
+    return model
+
+
 def load_backbone_with_adapter(cfg: Config, adapter_dir):
     """Reload a phase-1 backbone from a saved adapter, frozen. Used by phase 2 and eval."""
     from peft import PeftModel

@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import math
+import warnings
 from pathlib import Path
 
 import torch
@@ -48,12 +49,13 @@ from .losses.total import expected_init_values, phase1_loss
 from .model.backbone import (
     assert_phase1_trainable,
     load_backbone,
+    load_backbone_resume,
     load_tokenizer,
     param_groups,
     read_hidden_size,
 )
 from .model.wrapper import FeynmanPRM
-from .utils.checkpoint import save_checkpoint
+from .utils.checkpoint import load_config_from_checkpoint, load_heads, save_checkpoint
 from .utils.seeding import epoch_rng, goal_rng, probe_rng, seed_everything
 
 MIN_OPTIMIZER_STEPS = 300  # §11.1: below this the schedule is meaningless. Cut n_questions,
@@ -125,6 +127,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="skip the >=300 optimizer-step assert (smoke tests only)")
     parser.add_argument("--overwrite", action="store_true",
                         help="write into a run directory that already holds a checkpoint")
+    parser.add_argument("--resume", default=None, metavar="CHECKPOINT_DIR",
+                        help="continue a killed run from a stepN checkpoint: restores the "
+                             "weights, replays the LR schedule to that step, and consumes only "
+                             "the batches that step never saw. Optimizer moments restart at "
+                             "zero -- see the block at the resume site for what that costs.")
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config, args.set)
@@ -159,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
     existing = sorted(
         p.name for p in run_dir.glob("*") if p.is_dir() and (p / "heads.pt").exists()
     )
-    if existing and cfg.train.max_steps is None and not args.overwrite:
+    if existing and cfg.train.max_steps is None and not args.overwrite and not args.resume:
         raise SystemExit(
             f"{run_dir} already holds checkpoint(s): {', '.join(existing)}.\n"
             f"Change `run.name` in {args.config} (one directory per loss-set change), or pass "
@@ -199,13 +206,84 @@ def main(argv: list[str] | None = None) -> int:
             "min(4,k_c)+min(3,k_i) = 4.33, NOT 9.18. Cut n_questions, not grad_accum."
         )
 
+    # ---- resume: what is restored, and the one thing that is not ----------------------
+    # A stepN checkpoint holds the LoRA adapter, the psi/phi heads and the step number. Three of
+    # the four things a resume needs are therefore recoverable EXACTLY, and none of them are
+    # approximations:
+    #
+    #   * the weights          -- straight off the checkpoint;
+    #   * the LR               -- `build_scheduler` is a pure function of (step, steps_total),
+    #                             and `steps_total` here is the FULL plan, not the remainder,
+    #                             so replaying it `resume_step` times lands on exactly the LR
+    #                             an uninterrupted run would be holding at that step;
+    #   * the data position    -- `epoch_batches` is seeded off `cfg.run.seed` alone, so the
+    #                             batch ORDER is identical run to run and "the batches step N
+    #                             never saw" is just `batches[resume_step * grad_accum:]`.
+    #                             `goal_rng` is keyed on (seed, epoch, micro), so skipping by
+    #                             index leaves every surviving micro-batch bit-identical to what
+    #                             it would have been.
+    #
+    # THE FOURTH IS THE ADAM MOMENTS, AND THEY ARE GONE. save_checkpoint does not write
+    # optimizer state, so m and v restart at zero and the first steps after a resume are taken
+    # on bias-corrected estimates built from one gradient. This is the honest cost of the
+    # feature and it is not hidden: what bounds it is `betas = [0.9, 0.95]`, a second-moment
+    # half-life of ~14 steps, so the estimates are re-converged within ~40 of the ~700 steps a
+    # mid-run resume has left. A run with beta2 = 0.999 would NOT be safe to resume this way --
+    # its ~700-step memory is the same order as the remainder, and the transient would be a
+    # confound rather than a blip. If that ever changes, this comment is the thing to re-read.
+    resume_step = 0
+    if args.resume:
+        resume_dir = Path(args.resume)
+        if not (resume_dir / "heads.pt").exists():
+            raise SystemExit(f"--resume {resume_dir}: no heads.pt there")
+        resume_step = int(
+            torch.load(resume_dir / "heads.pt", map_location="cpu", weights_only=False)["step"]
+        )
+        if resume_step <= 0:
+            raise SystemExit(f"--resume {resume_dir}: checkpoint reports step {resume_step}")
+
+        # The loss set is the whole reason run directories are not shared (§7.12), and a resume
+        # is the one code path that reads weights trained under one config into a process
+        # configured by another. Silently continuing a lambda_cf=2.0 checkpoint under
+        # lambda_cf=1.0 would produce a curve that is a blend of two experiments and looks like
+        # neither. Compared here, before the GPU is touched, and fatal.
+        prev = load_config_from_checkpoint(resume_dir)
+        drift = {
+            k: (a, b)
+            for k, (a, b) in {
+                f.name: (getattr(prev.losses, f.name, None), getattr(cfg.losses, f.name))
+                for f in dataclasses.fields(cfg.losses)
+                if isinstance(getattr(cfg.losses, f.name), (int, float))
+            }.items()
+            if a != b
+        }
+        if drift:
+            raise SystemExit(
+                f"--resume {resume_dir} was trained under a different loss set: "
+                + ", ".join(f"{k} {a} -> {b}" for k, (a, b) in sorted(drift.items()))
+                + ".\nResuming across a loss-set change blends two experiments into one curve. "
+                "Launch a fresh run.name instead."
+            )
+        if prev.run.seed != cfg.run.seed:
+            raise SystemExit(
+                f"--resume {resume_dir}: seed {prev.run.seed} -> {cfg.run.seed}. The batch order "
+                f"is a function of the seed, so the skip would drop the wrong batches."
+            )
+
     # ---- model ----------------------------------------------------------------------
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = load_tokenizer(cfg)
     hidden_size = read_hidden_size(cfg.model.name)   # from config.json, never a doc (§13)
-    backbone = load_backbone(cfg)
+    backbone = load_backbone_resume(cfg, resume_dir / "adapter") if args.resume \
+        else load_backbone(cfg)
     model = FeynmanPRM(cfg, hidden_size, backbone=backbone, with_goal_head=False)
     model.pad_id = tokenizer.pad_token_id
+    if args.resume:
+        # The adapter came back with the backbone; the heads are the other half and they are
+        # the half §14's LoRA trap loses. `load_heads` raises if heads.pt carries no head
+        # parameters, so a resume cannot quietly restart psi/phi from random init under a
+        # trained backbone -- which would look like a loss spike and read as a bad resume.
+        load_heads(model, resume_dir)
     model.to(device)
     model.train()   # must precede the memory probe: eval mode disables gradient checkpointing
 
@@ -301,6 +379,21 @@ def main(argv: list[str] | None = None) -> int:
     # LambdaLR's constructor already applies lr_lambda(0), which is 0.0 under warmup -- so this
     # is NOT the base LR. The B6 guard tracks the range over the whole run instead of comparing
     # this against the final value; see the block after the loop.
+    if resume_step:
+        # `steps_total` is the FULL plan and is unchanged by resuming, so the cosine this
+        # replays is the same curve the original run was riding -- stepping it `resume_step`
+        # times lands on the LR an uninterrupted run would hold at that step, warmup included.
+        # Advanced by calling scheduler.step() rather than by setting last_epoch, because
+        # LambdaLR only writes the LR into the param groups from inside step().
+        # torch warns when scheduler.step() precedes the first optimizer.step(). That heuristic
+        # is about the ORDER inside a training loop and this is a deliberate fast-forward before
+        # the loop starts, so it fires `resume_step` times and says nothing true. Suppressed
+        # here and nowhere wider: `tests/test_resume.py` pins the LR this produces.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=r".*lr_scheduler\.step\(\).*")
+            for _ in range(resume_step):
+                scheduler.step()
+
     lr_before = optimizer.param_groups[0]["lr"]
     lr_min_seen = lr_max_seen = lr_before
 
@@ -327,13 +420,51 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # ---- train ----------------------------------------------------------------------
-    step = 0
+    step = resume_step
     checked_init = False
     stop = False
+
+    # Every optimizer step consumed exactly `grad_accum` micro-batches, so the boundary is
+    # exact: batches[:skip_micro] are the ones the checkpoint has already been trained on.
+    skip_micro = resume_step * cfg.train.grad_accum
+    if resume_step:
+        if skip_micro >= len(batches) * cfg.train.epochs:
+            raise SystemExit(
+                f"--resume at step {resume_step} consumes {skip_micro} micro-batches but the "
+                f"plan only has {len(batches) * cfg.train.epochs}: nothing left to train."
+            )
+        logger.event(
+            "train/resume",
+            {
+                "checkpoint": str(resume_dir),
+                "resume_step": resume_step,
+                "steps_total": steps_total,
+                "steps_remaining": steps_total - resume_step,
+                "micro_batches_skipped": skip_micro,
+                "micro_batches_remaining": len(batches) - skip_micro,
+                "lr_at_resume": lr_before,
+                # Read this against the ~14-step beta2 half-life, not as an error bar: the
+                # moments are the one piece of state a stepN checkpoint cannot return.
+                "optimizer_moments": "RESET TO ZERO (not saved in checkpoints)",
+                "beta2": cfg.train.betas[1],
+            },
+        )
+        print(
+            f"[resume] {resume_dir} @ step {resume_step}/{steps_total} | "
+            f"lr {lr_before:.3e} | skipping {skip_micro} micro-batches | "
+            f"{steps_total - resume_step} optimizer steps left",
+            flush=True,
+        )
+
     for epoch in range(cfg.train.epochs):
         if epoch > 0:
             batches = epoch_batches(rows, slots, cfg, epoch, epoch_rng(cfg.run.seed, epoch))
         for micro, batch_rows in enumerate(batches):
+            # Skipped by INDEX, never by consuming and discarding: `goal_rng` is keyed on
+            # (seed, epoch, micro), so the surviving micro-batches are bit-identical to the
+            # ones an uninterrupted run would have seen here.
+            if epoch == 0 and micro < skip_micro:
+                continue
             batch, goals, reps, matrices, out = run_micro_batch(
                 model, rows, batch_rows, cfg, device, goal_rng(cfg.run.seed, epoch, micro),
                 step=step, cf_ctx=cf_ctx,
@@ -357,6 +488,9 @@ def main(argv: list[str] | None = None) -> int:
                 logger.event(
                     "launch/init_values",
                     {
+                        # On a resume these are TRAINED values, not init values: the §18
+                        # comparison against `expected` does not apply and the event says so.
+                        "resumed_from_step": resume_step or None,
                         "expected": {k: round(v, 4) for k, v in expected.items()},
                         "actual": {k: round(float(v), 4) for k, v in out.terms.items()},
                         "note": (
