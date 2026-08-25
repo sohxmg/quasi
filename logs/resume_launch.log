@@ -1,0 +1,29 @@
+Note that running a local entrypoint in detached mode only keeps the last triggered Modal function alive after the parent process has been killed or disconnected.
+✓ Initialized. View run at 
+https://modal.com/apps/unrealparticles/main/ap-Wo30wHObXVWFbK3PMgyjUU
+✓ Created objects.
+├── 🔨 Created mount 
+│   /Users/macos/machinelearning/feynman_reasoning/feynman-prm/modal_cf_lam2_tau
+│   005.py
+├── 🔨 Created mount /Users/macos/machinelearning/feynman_reasoning/feynman-prm
+├── 🔨 Created function prepare.
+└── 🔨 Created function train_and_eval.
+
+=== stage 0: prepare (CPU) ===
+[prepare/argv] zeta=0.2 tau_nce=22.627417 mask_sibling_correct_late=False lambda_term=0.0 run=cf_lam2_tau005
+[prepare] data/processed already built: {'selection_sha_train': '09a03591fafd33c08f9361d35a791f98288c26e6964dd76bcd081b4fd594e972', 'selection_sha_val': '20f3ce6f730b07b531d9be5bc95c5f41078c74fd8da386128a4b302ce52769df', 'n_train_questions': 34650, 'n_val_questions': 2000, 'n_sequences': 335666, 'trajectories_per_question_on_disk': 9.15869031377899, 'sampler_sequences_per_question_expected': 4.33, 'dataset_stats': {'questions': 45989, 'trajectories': 422407, 'trajectories_per_question_mean': 9.184957272391223, 'fraction_correct': 0.3658414751649475, 'steps_per_solution_mean': 6.222082020421063, 'states_total': 3050658, 'first_error_index_mean': 1.4387078951592733, 'first_error_relative_mean': 0.24706729636041103, 'fraction_z_zero': 0.45408831797157606, 'recovery_fraction': 0.014826932318829944, 'questions_ge1_correct': 0.9183935288873426, 'questions_ge2_correct': 0.6335645480440975, 'trainable_questions': 40247, 'trainable_fraction': 0.8751440561873491, 'within_question_pairs': 977136, 'correct_per_question_mean': 3.3602383178586184, 'all_labels_equals_last_label': 0.9999905304599592, 'last_label_disagreements': 4}, 'length_stats': {'median': 248.0, 'p90': 518.0, 'p95': 634.0, 'p99': 867.0, 'max': 1024, 'mean': 294.67005594847257, 'over_max_len_dropped': 1720, 'over_max_len_fraction': 0.005124141259466255}, 'branch_points': {'branching_nodes': 79836, 'disagreeing_branch_points': 23935, 'questions': 34650}, 'dropped': {'too_long': 1720, 'empty_step': 3}, 'config': {'seed': 42, 'max_len': 1024, 'prompt_format': 'raw', 'model': 'Qwen/Qwen2.5-Math-1.5B-Instruct'}}
+[prepare] selection_sha_train=09a03591fafd33c08f9361d35a791f98288c26e6964dd76bcd081b4fd594e972
+[prepare] prefetching Qwen/Qwen2.5-Math-1.5B-Instruct into /cache/hf
+
+[1AFetching 10 files:   0%|          | 0/10 [00:00<?, ?it/s]
+[1AFetching 10 files: 100%|██████████| 10/10 [00:00<00:00, 1191.94it/s]
+    selection ok: 09a03591fafd33c08f9361d35a791f98288c26e6964dd76bcd081b4fd594e972
+
+=== stages 1-4: train + ProcessBench (A100 40 GB, ~4.2 h) ===
+    spawned: fc-01M0N5XX71ETC2WAS994091AYD  (written to logs/cf_lam2_tau005.call_id)
+
+This client is free to exit; the run does not depend on it.
+    collect: python modal_cf_lam2_tau005_finish.py
+[modal-client] 2026-08-22T22:17:51+0530 Timed out waiting for final app logs.
+✓ App completed. View run at 
+https://modal.com/apps/unrealparticles/main/ap-Wo30wHObXVWFbK3PMgyjUU

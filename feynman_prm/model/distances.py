@@ -21,6 +21,12 @@ Two things that are not negotiable:
 
 Memory: the halves are sliced BEFORE subtracting, so an (R, C, 512) difference is never
 materialised -- at R=348, C=172 the largest live intermediate is (R, C, K, 32) fp32 ~= 61 MB.
+
+IQE is the expensive one and needs watching: it sorts 2k values per group, so its working set
+is (R, C, D/k, 2k) and there are several of them. Its mask is built under no_grad at int16 and
+the sort permutation is applied to the MASK rather than to the data, which keeps the graph at
+13.1 kB/pair instead of 49.9 (full_mrn is 6.2). Measure with `saved_tensors_hooks`, not by
+eye, before changing anything in `iqe_distance` -- and keep the change bit-exact.
 """
 
 from __future__ import annotations
@@ -97,20 +103,43 @@ def iqe_distance(x: Tensor, y: Tensor, components: int, alpha: Tensor) -> Tensor
     ys = y.reshape(*y.shape[:-1], D_total // components, components)
     xs, ys = torch.broadcast_tensors(xs, ys)
 
-    valid = xs < ys
     D = xs.shape[-1]
     xy = torch.cat([xs, ys], dim=-1)
-    ixy = xy.argsort(dim=-1)
-    sxy = torch.gather(xy, -1, ixy)
-    sign = torch.where(ixy < D, -1.0, 1.0)
-    # gather's index may be LONGER than the source along the gathered dim, which is what
-    # `ixy % D` needs: 2D sorted positions indexing back into D validity flags
-    # (jnp.take_along_axis does the same at tmd.py:60).
-    neg_inc_copies = torch.gather(valid, -1, ixy % D).float() * sign
-    neg_inp_copies = torch.cumsum(neg_inc_copies, dim=-1)
-    neg_f = (neg_inp_copies < 0).float() * -1.0
-    neg_incf = torch.cat([neg_f[..., :1], neg_f[..., 1:] - neg_f[..., :-1]], dim=-1)
-    comps = (sxy * neg_incf).sum(dim=-1)
+
+    # Everything from here to `w` is the interval-counting mask: argsort / `<` / cumsum /
+    # a difference of two {0, -1} tensors. NOT ONE STEP OF IT HAS A GRADIENT, so it runs
+    # under no_grad and at int16 -- the transcription from tmd.py:56-63 left it in fp32 and
+    # int64 inside grad mode, which pinned nine (..., D/k, 2k) tensors for the backward and
+    # is what made IQE ~8x the memory of full_mrn per pair (49.9 kB/pair of graph against
+    # full_mrn's 6.2 kB). Values here are bounded by 2k, so int16 cannot overflow.
+    with torch.no_grad():
+        ixy = xy.argsort(dim=-1)
+        # tmd.py:60 indexes D validity flags from 2D sorted positions with `ixy % D`. Doing
+        # that literally allocates a SECOND int64 (..., 2k) tensor -- 24.6 kB/pair, live at
+        # the same moment as `ixy`, which is what set the peak. Tiling the flags to 2k
+        # instead costs 3 kB/pair of bool and indexes identically:
+        # cat([v, v])[i] == v[i % k] for every i in [0, 2k).
+        valid = xs < ys
+        inc = torch.gather(torch.cat([valid, valid], dim=-1), -1, ixy).to(torch.int16)
+        del valid
+        inc = torch.where(ixy < D, -inc, inc)          # tmd.py:59's `sign`, folded in
+        inc = inc.cumsum_(-1)
+        negf = inc.less_(0).to(torch.int16).neg_()     # {0, -1}
+        del inc
+        w_sorted = torch.empty_like(negf)
+        w_sorted[..., :1] = negf[..., :1]
+        torch.sub(negf[..., 1:], negf[..., :-1], out=w_sorted[..., 1:])
+        del negf
+        # tmd.py:63 gathers xy into sorted order and multiplies. `ixy` is a PERMUTATION of
+        # 0..2D-1, so sum_j xy[ixy[j]] * w_sorted[j] == sum_i xy[i] * w_sorted[ixy^-1[i]],
+        # and scatter_ along ixy is exactly that inverse. Same sum, but the permutation now
+        # happens on the mask instead of on the data -- so no differentiable `gather` saves
+        # the int64 `ixy` (24.6 kB/pair, the largest single tensor here) for the backward.
+        w = torch.zeros_like(ixy, dtype=torch.int16).scatter_(-1, ixy, w_sorted)
+        del ixy, w_sorted
+        w = w.to(xy.dtype)
+
+    comps = (xy * w).sum(dim=-1)   # the only differentiable op in the function
     return alpha * comps.mean(dim=-1) + (1 - alpha) * comps.amax(dim=-1)
 
 

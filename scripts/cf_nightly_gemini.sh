@@ -43,7 +43,8 @@
 # so a second rewrite set for one is a duplicate training row, not a second opinion.
 #
 # **BHARATCODE STILL RUNS AND IS SAFE TO RUN; CODEX IS NOT.** bharatcode resumes at cf002211,
-# which is in its OWN items file (`cf_items_70k_bc_keep.jsonl`) and not in this one, so the two
+# which is in its OWN items file (`cf_items_70k_bc_keep2.jsonl` since 2026-08-21, when the back
+# 20,000 of what it had left went to OpenAI -- cf007000..cf026999, still not this file) so the two
 # nightly scripts can both go out tonight -- `cf_nightly.sh` re-proves that against this file
 # before it requests anything. Codex is the opposite case: it would resume at cf048444, which
 # IS in this file, and `--resume` matches custom_ids inside ONE response file so neither side

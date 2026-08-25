@@ -64,7 +64,13 @@ fi
 # spent twice for one training row, and the slices are what makes that impossible rather than
 # unlikely. `split_cf_items.py --check` re-proves the three-way split below, every night, and
 # the HANDOVER guard after it re-proves this second cut against what Gemini actually holds.
-ITEMS=${ITEMS:-data/cf/cf_items_70k_bc_keep.jsonl}
+# **A SECOND 20,000 WENT TO OPENAI ON 2026-08-21** (cf007000..cf026999), because the paid
+# slice was exhausted and this run has not been started since 2026-08-11. Off the BACK again,
+# for the same reason: this run stopped at cf002200 and `--resume` walks forward, so at 4.53
+# ok/min it would need ~18 nights to reach cf007000. What is left here is cf000000..cf006999 --
+# 4,799 anchors it has never touched, still in front of it, and still its own.
+# `cf_items_70k_bc_keep.jsonl` (cf000000..cf026999) is kept only so the old runs stay readable.
+ITEMS=${ITEMS:-data/cf/cf_items_70k_bc_keep2.jsonl}
 OUT=${OUT:-data/cf/cf70k.jsonl}
 HOURS=${HOURS:-7.5}
 CONCURRENCY=${CONCURRENCY:-6}
@@ -117,11 +123,17 @@ fi
 # re-cut moves the boundary here automatically. The 2,201 anchors bharatcode already generated
 # are NOT the hazard -- `--resume` skips those -- so it compares only what tonight would
 # actually request.
-HANDOVER=${HANDOVER:-data/cf/cf_items_gm.jsonl}
-if [[ -f "$HANDOVER" ]]; then
-  "$PYTHON" - "$ITEMS" "${OUT%.jsonl}.responses.jsonl" "$HANDOVER" <<'PY' || exit 1
+#
+# **THERE ARE TWO HANDOVERS TO RE-PROVE SINCE 2026-08-21**, not one: gemini holds
+# cf027000..cf046999 and openai now holds cf007000..cf026999 as well. Both are checked, each
+# against the anchors THIS run would actually request tonight, and the loop means a third
+# handover is one filename away rather than a rewrite.
+HANDOVER=${HANDOVER:-data/cf/cf_items_gm.jsonl data/cf/cf_items_oai.jsonl}
+for PEER in $HANDOVER; do
+  [[ -f "$PEER" ]] || continue
+  "$PYTHON" - "$ITEMS" "${OUT%.jsonl}.responses.jsonl" "$PEER" <<'PY' || exit 1
 import json, sys
-items, responses, handover = sys.argv[1:4]
+items, responses, peer = sys.argv[1:4]
 def ids(path, nonnull=False):
     out = set()
     for line in open(path):
@@ -140,23 +152,29 @@ try:
     done = ids(responses, nonnull=True)
 except FileNotFoundError:
     done = set()
-clash = sorted((ids(items) - done) & ids(handover))
+clash = sorted((ids(items) - done) & ids(peer))
 if clash:
     print(f"!! REFUSING: {len(clash):,} of the anchors tonight would request are in "
-          f"{handover},\n   which gemini is generating RIGHT NOW (e.g. {', '.join(clash[:5])})."
+          f"{peer},\n   which another endpoint is generating RIGHT NOW "
+          f"(e.g. {', '.join(clash[:5])})."
           f"\n   Every one of them would be paid for twice for one training row.\n"
-          f"   THE CUT MOVED. Since 2026-08-14 this run owns cf000000..cf026999 and gemini "
-          f"owns\n   cf027000..cf046999, which do not overlap -- so this guard passing is the "
-          f"normal\n   case and a refusal means one side was re-pointed. Check ITEMS is "
-          f"cf_items_70k_bc_keep.jsonl\n   and not the undivided cf_items_70k_bc.jsonl, then "
-          f"re-cut gemini's file if it really\n   did widen:\n"
+          f"   THE CUT MOVED. Since 2026-08-21 this run owns cf000000..cf006999, openai owns\n"
+          f"   cf007000..cf026999 plus cf067000..cf069999, and gemini owns "
+          f"cf027000..cf066999 --\n   which do not overlap, so this guard passing is the "
+          f"normal case and a refusal means one\n   side was re-pointed. Check ITEMS is "
+          f"cf_items_70k_bc_keep2.jsonl and not the wider\n   cf_items_70k_bc_keep.jsonl or "
+          f"the undivided cf_items_70k_bc.jsonl, then re-cut the\n   peer's file if it really "
+          f"did widen:\n"
           f"     python3 scripts/cf_exclude_generated.py \\\n"
-          f"         --slice data/cf/cf_items_gm_src.jsonl --out {handover} \\\n"
-          f"         --self data/cf/cf70k_gm.responses.jsonl",
+          f"         --slice data/cf/cf_items_gm_src.jsonl --out data/cf/cf_items_gm.jsonl \\\n"
+          f"         --self data/cf/cf70k_gm.responses.jsonl\n"
+          f"     python3 scripts/cf_exclude_generated.py \\\n"
+          f"         --slice data/cf/cf_items_oai_src.jsonl --out data/cf/cf_items_oai.jsonl \\\n"
+          f"         --self data/cf/cf70k_oai.responses.jsonl",
           file=sys.stderr)
     raise SystemExit(1)
 PY
-fi
+done
 
 mkdir -p "$LOGDIR" "$(dirname "$OUT")"
 TOTAL=$(wc -l < "$ITEMS" | tr -d ' ')

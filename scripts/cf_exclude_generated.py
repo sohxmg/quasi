@@ -27,6 +27,13 @@ different `--out`, and there are two such cases:
   * A HANDOVER. Codex went down on 2026-08-10 having generated **1,440** of its 20,000-anchor
     slice into `cf70k_cx.jsonl.responses.jsonl`, and Gemini took the slice over under a new
     `--out`. Same blindness, 65x the cost. MEASURED: 20,000 -> 18,560 to generate.
+  * A HANDOVER INTO A LIVE CAMPAIGN, which is the 2026-08-21 case and the one that reads
+    oddly. OpenAI exhausted its 3,000-anchor slice and took the back 20,000 of what was left
+    of bharatcode's, so its `--slice` is now the UNION of both blocks
+    (`cf_items_oai_src.jsonl`). The 2,980 anchors it had already generated are in `--self`, so
+    they are NOT held out: they stay in the items file and `--resume` skips them, which is why
+    the file is 22,980 and the night's counter says 20,000 to go. Holding them out here would
+    work too, and would make every night's "N to go" disagree with the ones before it.
 
 WHY EXCLUDE AND NOT RE-GENERATE THEM. `L_CF` keys on the ANCHOR. A second rewrite set for an
 anchor that already has one is a duplicate training row, not a second opinion -- the same
@@ -55,8 +62,12 @@ import json
 import sys
 from pathlib import Path
 
-SLICE = "data/cf/cf_items_70k_oai.jsonl"
-OUT = "data/cf/cf_items_70k_oai_luna.jsonl"
+# The OpenAI run's, because it was the first caller -- but UPDATED 2026-08-21 to the union
+# slice it reads now. Leaving them at the exhausted `cf_items_70k_oai.jsonl` ->
+# `cf_items_70k_oai_luna.jsonl` pair would mean a bare `python3 scripts/cf_exclude_generated.py`
+# silently rebuilt the file the campaign STOPPED reading, and reported success doing it.
+SLICE = "data/cf/cf_items_oai_src.jsonl"
+OUT = "data/cf/cf_items_oai.jsonl"
 # Every response file in data/cf, EXCEPT the one this campaign will itself write -- that one is
 # `--resume`'s job, and reading it here would make the items file shrink every night.
 RESPONSES_GLOB = "data/cf/*responses.jsonl"

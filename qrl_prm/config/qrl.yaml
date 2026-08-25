@@ -1,0 +1,106 @@
+# QRL's own knobs, and NOTHING else. Everything shared with Feynman-PRM -- dataset,
+# selection, seed, batch stream, tokenisation, backbone, LoRA, optimiser, schedule, CF
+# corpus, eval protocol -- comes from `config/default.yaml` UNCHANGED, which is what makes
+# the QRL row and the Feynman-PRM rows differ in the objective and nothing else.
+#
+# Strict-parsed (qrl_prm/config.py): an unknown or misspelled key is a HARD ERROR.
+#
+#   python -m qrl_prm.train --set run.name=qrl_iqe --set distance.variant=iqe
+#   python -m qrl_prm.train --set run.name=qrl_cheap --set qrl.cf_encode_max_tokens=8192
+#
+# `run.name` and `distance.variant` come through `--set`, so `config/default.yaml` is never
+# edited for this run. `qrl_prm/train.sh` supplies both.
+#
+# NOT `losses.*` in config/default.yaml. Not one key of that block is read by anything in
+# qrl_prm/ -- QRL's weights are LEARNED dual variables, not fixed lambdas. train.py refuses
+# to start if a `--set losses.*` override is passed, because it would be silently inert.
+
+softplus_offset: 25     # losses/global_push.py:26. "Should be greater than most GT distances
+                        # between sampled pairs" -- QRL's own words. Online default 15;
+                        # offline maze2d used 500 for a horizon of hundreds of steps. Our
+                        # horizon is T ~ 10 reasoning steps at step_cost 1, and 25 is the
+                        # clip_t_gain = 20 precedent's order.
+                        #
+                        # READ `qrl/push_saturated_frac` AT LAUNCH AND AGAIN AT STEP ~300.
+                        # It is the fraction of (state, goal) pairs already past the offset,
+                        # where softplus is flat and the push term has no gradient. A large
+                        # and rising value means the offset is too small and the objective
+                        # has stopped maximising anything.
+
+softplus_beta: 0.1      # losses/global_push.py:23. Smaller => smoother loss. QRL's default,
+                        # unchanged. Note F.softplus's `beta` scales the INPUT and divides
+                        # the output: softplus_0.1(x) = 10 * log(1 + exp(0.1 x)).
+
+step_cost: 1.0          # losses/local_constraint.py:29. One observed reasoning step IS the
+                        # unit of the metric. `qrl/local_dist_mean` should pin to ~1.0, and
+                        # that curve is the direct answer to IMPLEMENTATION.md §9's decaying
+                        # ruler: under the fixed-weight losses `backup/delta_mean` drifted
+                        # off -log gamma with nothing holding it; here it is a CONSTRAINT
+                        # with its own dual variable, not a target a soft loss trades away.
+
+epsilon_local: 0.25     # losses/local_constraint.py:22. QRL's default. The constraint is
+                        # ONE-SIDED -- `(d - step_cost).relu().square()` -- so a transition
+                        # shorter than one step costs nothing; only overshoot is penalised.
+                        # The push term is what stops everything collapsing to zero.
+
+epsilon_cf: 0.2         # NO QRL COUNTERPART: counterfactual invariance is this project's
+                        # term. It is the radius of the ball two meaning-preserving wordings
+                        # of one step may sit in, in BOTH directions, so the class diameter
+                        # is bounded by 2 * epsilon_cf = 0.4 via the triangle inequality.
+                        # It must stay far below the ruler a verdict is read against -- the
+                        # old margin ruler is 2 log 2 = 1.3863 (§7.6) -- or a paraphrase
+                        # could move a step across the decision boundary, which is the exact
+                        # failure (4) L_CF exists to prevent. config.py rejects any value at
+                        # or above 1.3863.
+
+init_lagrange: 0.01     # losses/local_constraint.py:31. QRL's default, for BOTH multipliers.
+                        # Stored as `softplus_inv(0.01)`; the trained quantity is the raw
+                        # pre-softplus scalar, so the multiplier can never go negative.
+
+lagrange_lr: 0.01       # losses/__init__.py:47 -- QRL's `lagrange_mult_optim` lr 1e-2, its
+                        # own AdamW at betas (0.9, 0.999), weight_decay 0, CONSTANT. The dual
+                        # variable must track the constraint for the whole run, so it does
+                        # NOT ride the primal's cosine decay. Note the betas differ from the
+                        # main optimiser's (0.9, 0.95) on purpose: this is QRL's spec.
+
+cf_neg_push_weight: 1.0 # Weight on the CF-NEGATIVE push term. CF negatives enter as SOURCES:
+                        # softplus(offset - d(psi(prefix + neg), psi_g)) over same-question goal
+                        # columns -- the eval-aligned direction, a broken state as the source
+                        # of the query. They are NEVER in the CF constraint (that would assert
+                        # two different wrong steps are the same point). 0.0 makes the term an
+                        # exact zero with `qrl/neg_push_*` still logged.
+
+cf_encode_max_tokens: 16384
+                        # PADDED-TOKEN BUDGET FOR THE CF VARIANT FORWARD, counted the way the
+                        # GPU pays for it: sequences x longest, not the token sum.
+                        #
+                        # THIS IS THE KNOB `data.cf_max_per_batch` USED TO BE. Under the old
+                        # `cf_phi` path a rewritten step cost an embedding lookup and an MLP
+                        # (§7.5.3 option (b)), because `phi` PREDICTED the arrived state from a
+                        # prefix the main batch had already forwarded. There is no phi here:
+                        # the environment is deterministic, so the arrived state is
+                        # psi(prompt + steps[:i] + variant + SEP) and it is READ, through a
+                        # real second LM forward (qrl_prm/cf_encode.py). At
+                        # data.cf_max_per_batch = 12 and ~8 rewrites per example that is ~96
+                        # sequences against a main batch of ~51.
+                        #
+                        # 16384 is half `sampling.max_padded_tokens`, the main batch's own cap.
+                        # Whole EXAMPLES are dropped off the TAIL of the seeded selection order
+                        # once the budget is met -- never individual variants (half a class is
+                        # a different constraint, not a smaller one) and never the longest
+                        # (that would train the constraint on short steps only, and no curve
+                        # would say so). The drop is counted in `cf/examples_dropped_budget`.
+                        #
+                        # READ `cf/encode_padded_tokens` AGAINST IT and `launch/memory_probe`'s
+                        # `cf_encode` block. If the card cannot take both forwards, lower this
+                        # before lowering `data.cf_max_per_batch` -- it trims per batch, where
+                        # the cap trims the corpus's coverage across the epoch.
+
+push_chunk_cols: 0      # 0 = build the (S, C) push matrix in one shot (~404 x 172 ~ 69k
+                        # pairs). A positive value splits it into chunks of that many GOAL
+                        # COLUMNS and accumulates the mean EXACTLY (weighted by each chunk's
+                        # column count -- tests pin chunked == unchunked). It lowers the
+                        # TRANSIENT peak of the distance's internals, which matters for IQE
+                        # (it materialises several (S, C, D/k, 2k) fp32 tensors); it does NOT
+                        # shrink the autograd graph. Reach for it only if
+                        # `launch/memory_probe` says the card cannot take the one-shot form.

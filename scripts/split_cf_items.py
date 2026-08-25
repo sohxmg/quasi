@@ -39,7 +39,17 @@ SOURCE = "data/cf/cf_items_70k.jsonl"
 # (cf000000..cf026999) and Gemini reads the tail as part of `cf_items_gm.jsonl`. The cut is off
 # the BACK for the same reason the OpenAI slice is: `--resume` walks in order, so the front is
 # what bharatcode consumes first and the two campaigns cannot meet. `cf_nightly.sh` re-proves
-# the cut against Gemini's items file every night.
+# the cut against Gemini's items file every night.#
+# **AND THE BACK 20,000 OF WHAT REMAINED WENT TO OPENAI ON 2026-08-21** (cf007000..cf026999),
+# when the 3,000-anchor OpenAI slice was exhausted -- 2,980 of 2,980 generated -- and this
+# slice had sat untouched since 2026-08-11 at cf002200. AGAIN THE SLICE FILE DID NOT MOVE:
+# bharatcode now reads `cf_items_70k_bc_keep2.jsonl` (cf000000..cf006999) and OpenAI reads the
+# handed-over block as part of `cf_items_oai.jsonl`. So ONE source file is now read by three
+# endpoints under four blocks, and no custom_id changed meaning in any of them:
+#     cf000000..cf006999   bharatcode   cf_items_70k_bc_keep2.jsonl
+#     cf007000..cf026999   openai       cf_items_oai.jsonl  (with the block below)
+#     cf027000..cf066999   gemini       cf_items_gm.jsonl
+#     cf067000..cf069999   openai       -- exhausted 2026-08-21, kept so `--resume` sees it
 BHARATCODE = "data/cf/cf_items_70k_bc.jsonl"
 CODEX = "data/cf/cf_items_70k_cx.jsonl"
 OPENAI = "data/cf/cf_items_70k_oai.jsonl"

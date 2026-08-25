@@ -1,0 +1,210 @@
+Note that running a local entrypoint in detached mode only keeps the last triggered Modal function alive after the parent process has been killed or disconnected.
+✓ Initialized. View run at 
+https://modal.com/apps/unrealparticles/main/ap-E8urf7zRzoyUVjXypcEIqZ
+✓ Created objects.
+├── 🔨 Created mount 
+│   /Users/macos/machinelearning/feynman_reasoning/feynman-prm/modal_cf_lam2_tau
+│   005.py
+├── 🔨 Created mount /Users/macos/machinelearning/feynman_reasoning/feynman-prm
+├── 🔨 Created function prepare.
+└── 🔨 Created function train_and_eval.
+
+=== stage 0: prepare (CPU) ===
+[prepare/argv] zeta=0.2 tau_nce=22.627417 mask_sibling_correct_late=False lambda_term=0.0 run=cf_lam2_tau005
+[prepare] data/processed already built: {'selection_sha_train': '09a03591fafd33c08f9361d35a791f98288c26e6964dd76bcd081b4fd594e972', 'selection_sha_val': '20f3ce6f730b07b531d9be5bc95c5f41078c74fd8da386128a4b302ce52769df', 'n_train_questions': 34650, 'n_val_questions': 2000, 'n_sequences': 335666, 'trajectories_per_question_on_disk': 9.15869031377899, 'sampler_sequences_per_question_expected': 4.33, 'dataset_stats': {'questions': 45989, 'trajectories': 422407, 'trajectories_per_question_mean': 9.184957272391223, 'fraction_correct': 0.3658414751649475, 'steps_per_solution_mean': 6.222082020421063, 'states_total': 3050658, 'first_error_index_mean': 1.4387078951592733, 'first_error_relative_mean': 0.24706729636041103, 'fraction_z_zero': 0.45408831797157606, 'recovery_fraction': 0.014826932318829944, 'questions_ge1_correct': 0.9183935288873426, 'questions_ge2_correct': 0.6335645480440975, 'trainable_questions': 40247, 'trainable_fraction': 0.8751440561873491, 'within_question_pairs': 977136, 'correct_per_question_mean': 3.3602383178586184, 'all_labels_equals_last_label': 0.9999905304599592, 'last_label_disagreements': 4}, 'length_stats': {'median': 248.0, 'p90': 518.0, 'p95': 634.0, 'p99': 867.0, 'max': 1024, 'mean': 294.67005594847257, 'over_max_len_dropped': 1720, 'over_max_len_fraction': 0.005124141259466255}, 'branch_points': {'branching_nodes': 79836, 'disagreeing_branch_points': 23935, 'questions': 34650}, 'dropped': {'too_long': 1720, 'empty_step': 3}, 'config': {'seed': 42, 'max_len': 1024, 'prompt_format': 'raw', 'model': 'Qwen/Qwen2.5-Math-1.5B-Instruct'}}
+[prepare] selection_sha_train=09a03591fafd33c08f9361d35a791f98288c26e6964dd76bcd081b4fd594e972
+[prepare] prefetching Qwen/Qwen2.5-Math-1.5B-Instruct into /cache/hf
+
+[1AFetching 10 files:   0%|          | 0/10 [00:00<?, ?it/s]
+[1AFetching 10 files: 100%|██████████| 10/10 [00:00<00:00, 811.80it/s]
+    selection ok: 09a03591fafd33c08f9361d35a791f98288c26e6964dd76bcd081b4fd594e972
+
+=== stages 1-4: train + ProcessBench (A100 40 GB, ~4.2 h) ===
+[gpu] NVIDIA A100-SXM4-40GB  bf16=True  torch=2.13.0+cu130
+
+==============================================================================
+[1/train_cloud] bash scripts/train_cloud.sh --set losses.zeta=0.2 --set losses.nce_temperature=22.627417 --set losses.lambda_term=0.0 --set losses.lambda_cf=2.0 --set losses.lambda_cf_temperature=0.05 --set run.name=cf_lam2_tau005
+==============================================================================
+==============================================================================
+ train_cloud.sh   PROFILE=match
+   batch shape: UNCHANGED from config/default.yaml (56 seqs / 32768 tok / accum 2)
+   -> every loss statistic is comparable to runs/phase1_nce_temp_relu2 (0.560 val F1)
+   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+==============================================================================
+
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from WANDB_API_KEY.
+wandb: Currently logged in as: unrealparticles (unrealparticles-iit-roor) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: Tracking run with wandb version 0.28.2
+wandb: Run data is saved locally in /root/quasi/wandb/run-20260822_003548-tng5sf4a
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run cf_lam2_tau005
+wandb: ⭐️ View project at https://wandb.ai/unrealparticles-iit-roor/feynman-prm
+wandb: 🚀 View run at https://wandb.ai/unrealparticles-iit-roor/feynman-prm/runs/tng5sf4a
+[wandb/run] https://wandb.ai/unrealparticles-iit-roor/feynman-prm/runs/tng5sf4a
+[launch/data] {"questions": 34640, "sequences_per_question": 4.312, "optimizer_steps": 1464, "warmup_steps": 44, "n_batches": 2928, "sequences_total": 149351, "sequences_per_batch_mean": 51.0079, "questions_per_batch_mean": 11.8306, "distinct_z_per_batch_mean": 25.8525, "step_pairs_per_batch_mean": 58.4358, "padding_fraction": 0.2628, "max_padded_tokens": 32768}
+
+[1ALoading weights:   0%|          | 0/338 [00:00<?, ?it/s]
+[1ALoading weights:   9%|▉         | 30/338 [00:00<00:01, 298.36it/s]
+[1ALoading weights:  18%|█▊        | 60/338 [00:00<00:01, 234.44it/s]
+[1ALoading weights:  25%|██▌       | 85/338 [00:00<00:01, 224.03it/s]
+[1ALoading weights:  32%|███▏      | 108/338 [00:00<00:01, 213.22it/s]
+[1ALoading weights:  38%|███▊      | 130/338 [00:00<00:01, 176.73it/s]
+[1ALoading weights:  48%|████▊     | 162/338 [00:00<00:00, 202.24it/s]
+[1ALoading weights:  54%|█████▍    | 183/338 [00:00<00:00, 202.38it/s]
+[1ALoading weights:  61%|██████    | 205/338 [00:00<00:00, 202.39it/s]
+[1ALoading weights:  67%|██████▋   | 226/338 [00:01<00:00, 202.28it/s]
+[1ALoading weights: 100%|██████████| 338/338 [00:01<00:00, 305.98it/s]
+[cf] 8 of 36073 CF examples sit on 2 question(s) that are in NO split of sequences.parquet -- every trajectory of those questions was dropped at tokenisation (§4.6), so there is no prefix to attach to. Dropped, and in the launch/cf_data event.
+[launch/cf_data] {"examples": 36065, "distinct_prefixes": 36065, "max_per_batch": 12, "lambda_cf": 2.0, "rows_with_prefix_hash": 317446, "rows": 317446, "examples_total": 36073, "examples_kept": 36065, "examples_dropped_question_absent": 8, "questions_absent": 2, "questions_absent_sample": ["27049bc77f48221a5260393110bd4980d6e76a09", "4df98f818201801ad6eef66d270c361ab9738433"]}
+[launch/model] {"hidden_size": 1536, "trainable_tensors": {"lora": 392, "psi": 14, "phi": 14, "goal_head": 0, "action_pool": 0, "distance": 0, "other": 0}, "trainable_params": 22407168, "device": "cuda", "attn_implementation": "sdpa"}
+/root/quasi/feynman_prm/train.py:325: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /__w/pytorch/pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:822.)
+  "loss": float(probe_out.total),
+[launch/memory_probe] {"batch_index": 1391, "sequences": 32, "max_length": 1024, "peak_vram_gb": 12.096, "loss": 23.893901824951172}
+[launch/init_values] {"expected": {"nce": 6.2538, "step": 1.9155, "backup": NaN, "invariance": 10.5974, "cf": 0.0, "good": NaN, "term": 1.2851}, "actual": {"nce": 6.2522, "invariance": 10.595, "backup": 4.5503, "cf": 2.1419, "step": 1.9929, "good": 0.6722, "term": 1.0257}, "note": "L_NCE ~ log(R); L_step is softplus(m - Delta) at the MEASURED Delta, not ln 5 -- Delta_{z+1} starts negative because psi_0 (the prompt-only state) is atypical, so ~4 at init is expected and 1.61 is the Delta = 0 fixture value only (\u00a77.6); L_T at init is the psi/phi representation gap delta ~ 10 riding the LINEX LINEAR branch, so linear_branch_fraction ~ 1.0 and L_I ~ dist_mean ~ 11 are both correct here (\u00a77.4.3). L_NCE pinned at log(R) with logit_std ~= 0 is bug B10a. L_good has NO predicted level (nan on purpose) -- check the sandwich f(good/delta_min - c) <= L_good <= f(good/delta_max - c) in the CONFIGURED form (good_form below), which runs OPPOSITE to L_step's, and note a lower bound of exactly 0 is legitimate (\u00a77.12).", "step_delta_mean": -0.3699, "good_margin": -0.6931, "good_form": "relu_squared", "lambda_good": 1.0, "nce_temperature": 22.627417, "good_delta_mean": -0.4449, "good_above_target_fraction": 0.7232, "logit_std": 0.01477, "clip_t": 3.6889, "linear_branch_fraction": 0.6074}
+step      1  L=+24.1973  nce=+6.1905  inv=+10.4214  bkp=+5.3020  step=+2.2153  good=+0.6332  gap=-0.2768  above=+0.7966  spread=+3.6186  Q=+10.0000  z=+22.0000
+step     10  L=+20.4991  nce=+5.9017  inv=+7.4874  bkp=+2.2417  step=+2.3303  good=+0.5807  gap=-0.4989  above=+0.7850  spread=+4.2476  Q=+8.0000  z=+21.0000
+step     20  L=+15.5839  nce=+5.5124  inv=+3.8007  bkp=-0.4578  step=+1.9495  good=+0.4962  gap=-0.0120  above=+0.8352  spread=+2.6303  Q=+13.0000  z=+31.0000
+step     30  L=+13.2085  nce=+6.0095  inv=+1.0484  bkp=+0.0907  step=+1.6250  good=+0.5083  gap=+0.0535  above=+0.9427  spread=+1.3716  Q=+13.0000  z=+30.0000
+step     40  L=+12.6039  nce=+5.8927  inv=+0.5053  bkp=-0.0384  step=+1.6686  good=+0.4750  gap=-0.0386  above=+0.9856  spread=+0.5382  Q=+14.0000  z=+28.0000
+step     50  L=+12.7147  nce=+6.2292  inv=+0.3009  bkp=+0.0616  step=+1.6205  good=+0.4709  gap=-0.0002  above=+1.0000  spread=+0.3956  Q=+14.0000  z=+31.0000
+step     60  L=+11.7587  nce=+5.3202  inv=+0.2437  bkp=+0.0820  step=+1.6092  good=+0.4390  gap=+0.0388  above=+1.0000  spread=+0.2224  Q=+11.0000  z=+25.0000
+step     70  L=+12.7268  nce=+6.2427  inv=+0.1930  bkp=+0.1349  step=+1.6128  good=+0.4880  gap=-0.0003  above=+1.0000  spread=+0.2449  Q=+13.0000  z=+28.0000
+step     80  L=+12.3109  nce=+5.8645  inv=+0.1800  bkp=+0.1468  step=+1.6068  good=+0.4621  gap=+0.0242  above=+1.0000  spread=+0.1590  Q=+12.0000  z=+27.0000
+step     90  L=+12.2201  nce=+5.8238  inv=+0.1877  bkp=+0.1476  step=+1.6390  good=+0.4363  gap=+0.0033  above=+1.0000  spread=+0.1556  Q=+14.0000  z=+27.0000
+step    100  L=+12.1804  nce=+5.6212  inv=+0.1638  bkp=+0.1427  step=+1.6543  good=+0.4015  gap=+0.0131  above=+1.0000  spread=+0.1875  Q=+11.0000  z=+25.0000
+step    110  L=+12.2676  nce=+6.0045  inv=+0.1566  bkp=+0.1569  step=+1.5900  good=+0.4034  gap=+0.0918  above=+1.0000  spread=+0.1457  Q=+13.0000  z=+31.0000
+step    120  L=+12.2333  nce=+5.7537  inv=+0.1756  bkp=+0.1488  step=+1.6373  good=+0.4114  gap=+0.0296  above=+1.0000  spread=+0.2521  Q=+14.0000  z=+27.0000
+step    130  L=+12.2638  nce=+5.9871  inv=+0.1594  bkp=+0.1838  step=+1.6261  good=+0.4036  gap=+0.0545  above=+1.0000  spread=+0.1589  Q=+14.0000  z=+28.0000
+step    140  L=+12.5229  nce=+6.1655  inv=+0.1555  bkp=+0.1596  step=+1.5888  good=+0.4484  gap=+0.0674  above=+1.0000  spread=+0.2381  Q=+12.0000  z=+24.0000
+step    150  L=+11.3515  nce=+5.1448  inv=+0.1738  bkp=+0.1761  step=+1.6951  good=+0.2803  gap=+0.0965  above=+1.0000  spread=+0.1446  Q=+11.0000  z=+25.0000
+step    160  L=+11.3904  nce=+4.9452  inv=+0.1528  bkp=+0.1553  step=+1.7202  good=+0.2683  gap=+0.0543  above=+1.0000  spread=+0.1224  Q=+9.0000  z=+22.0000
+step    170  L=+11.5701  nce=+5.3203  inv=+0.1570  bkp=+0.1361  step=+1.5907  good=+0.2585  gap=+0.2353  above=+1.0000  spread=+0.1181  Q=+12.0000  z=+26.0000
+step    180  L=+11.6756  nce=+5.4436  inv=+0.1702  bkp=+0.1608  step=+1.6717  good=+0.3286  gap=+0.0764  above=+1.0000  spread=+0.1975  Q=+12.0000  z=+22.0000
+step    190  L=+11.7074  nce=+5.5067  inv=+0.1662  bkp=+0.1450  step=+1.7108  good=+0.3170  gap=+0.0534  above=+1.0000  spread=+0.1665  Q=+13.0000  z=+24.0000
+step    200  L=+12.1986  nce=+5.9766  inv=+0.1345  bkp=+0.1132  step=+1.6143  good=+0.3842  gap=+0.1124  above=+0.9861  spread=+0.1785  Q=+14.0000  z=+27.0000
+step    210  L=+12.5493  nce=+6.3055  inv=+0.1664  bkp=+0.1503  step=+1.5626  good=+0.4467  gap=+0.1209  above=+0.9976  spread=+0.2042  Q=+13.0000  z=+28.0000
+step    220  L=+8.2981  nce=+6.1193  inv=+0.1650  bkp=+0.0860  step=+1.6221  good=+0.3745  gap=+0.1066  above=+0.9840  spread=+0.2529  Q=+15.0000  z=+27.0000
+step    230  L=+11.7723  nce=+5.4436  inv=+0.1486  bkp=+0.1358  step=+1.6836  good=+0.3066  gap=+0.0784  above=+1.0000  spread=+0.1494  Q=+14.0000  z=+29.0000
+step    240  L=+12.3583  nce=+6.0745  inv=+0.1589  bkp=+0.1293  step=+1.6803  good=+0.3904  gap=+0.0152  above=+1.0000  spread=+0.3184  Q=+14.0000  z=+28.0000
+step    250  L=+12.1712  nce=+6.1325  inv=+0.1894  bkp=+0.1354  step=+1.5755  good=+0.3865  gap=+0.1616  above=+0.9775  spread=+0.2676  Q=+12.0000  z=+25.0000
+step    260  L=+12.2899  nce=+6.0769  inv=+0.1777  bkp=+0.1321  step=+1.5515  good=+0.5302  gap=+0.1242  above=+0.9736  spread=+0.2770  Q=+9.0000  z=+22.0000
+step    270  L=+12.1203  nce=+6.0542  inv=+0.1699  bkp=+0.1238  step=+1.5297  good=+0.3128  gap=+0.2842  above=+0.9915  spread=+0.1396  Q=+15.0000  z=+29.0000
+step    280  L=+11.2813  nce=+5.2778  inv=+0.2123  bkp=+0.0642  step=+1.5926  good=+0.2334  gap=+0.2811  above=+0.9898  spread=+0.1113  Q=+13.0000  z=+29.0000
+step    290  L=+11.1226  nce=+5.0195  inv=+0.1902  bkp=+0.0787  step=+1.5819  good=+0.2700  gap=+0.2947  above=+0.8874  spread=+0.2490  Q=+11.0000  z=+24.0000
+step    300  L=+11.3348  nce=+5.6401  inv=+0.2229  bkp=+0.0525  step=+1.4768  good=+0.5486  gap=+0.2132  above=+0.9849  spread=+0.5839  Q=+7.0000  z=+16.0000
+step    310  L=+11.8592  nce=+5.9491  inv=+0.1717  bkp=+0.1070  step=+1.5907  good=+0.3443  gap=+0.2095  above=+0.9666  spread=+0.3714  Q=+9.0000  z=+19.0000
+step    320  L=+12.3477  nce=+6.3125  inv=+0.2103  bkp=+0.0866  step=+1.5557  good=+0.3979  gap=+0.2008  above=+0.9949  spread=+0.4592  Q=+15.0000  z=+27.0000
+step    330  L=+12.1323  nce=+6.2245  inv=+0.1735  bkp=+0.1054  step=+1.4792  good=+0.3835  gap=+0.3094  above=+0.9601  spread=+0.2748  Q=+12.0000  z=+26.0000
+step    340  L=+11.7645  nce=+6.1255  inv=+0.1561  bkp=+0.0396  step=+1.3618  good=+0.4056  gap=+0.4738  above=+0.9782  spread=+0.4177  Q=+11.0000  z=+25.0000
+step    350  L=+11.9757  nce=+6.1504  inv=+0.1862  bkp=+0.0852  step=+1.5307  good=+0.4342  gap=+0.2487  above=+0.9640  spread=+0.4916  Q=+13.0000  z=+29.0000
+step    360  L=+11.5801  nce=+5.8729  inv=+0.1720  bkp=+0.0597  step=+1.4737  good=+0.4238  gap=+0.3987  above=+0.9499  spread=+0.3365  Q=+13.0000  z=+27.0000
+step    370  L=+12.1244  nce=+6.1475  inv=+0.1478  bkp=+0.0654  step=+1.6502  good=+0.4111  gap=+0.0655  above=+0.9838  spread=+0.4215  Q=+11.0000  z=+25.0000
+step    380  L=+12.2672  nce=+6.2713  inv=+0.1603  bkp=+0.0866  step=+1.5358  good=+0.4182  gap=+0.2272  above=+0.9676  spread=+0.3718  Q=+13.0000  z=+27.0000
+step    390  L=+11.6891  nce=+5.9454  inv=+0.1396  bkp=+0.0388  step=+1.6451  good=+0.4215  gap=+0.1357  above=+0.9519  spread=+0.5872  Q=+11.0000  z=+28.0000
+step    400  L=+10.7849  nce=+5.0930  inv=+0.1798  bkp=-0.0311  step=+1.3826  good=+0.2085  gap=+0.7984  above=+0.8636  spread=+0.4538  Q=+11.0000  z=+26.0000
+step    410  L=+11.8848  nce=+5.9485  inv=+0.1529  bkp=+0.0357  step=+1.6086  good=+0.4422  gap=+0.1293  above=+0.9792  spread=+0.7099  Q=+14.0000  z=+27.0000
+step    420  L=+11.5221  nce=+5.7608  inv=+0.1535  bkp=+0.0082  step=+1.5870  good=+0.3295  gap=+0.2138  above=+0.9825  spread=+0.3772  Q=+12.0000  z=+27.0000
+step    430  L=+10.5249  nce=+4.9352  inv=+0.1693  bkp=-0.1106  step=+1.1800  good=+0.3327  gap=+1.1482  above=+0.8304  spread=+0.6092  Q=+12.0000  z=+23.0000
+step    440  L=+11.3202  nce=+5.7059  inv=+0.1763  bkp=-0.0726  step=+1.5117  good=+0.3502  gap=+0.3801  above=+0.9648  spread=+0.5019  Q=+12.0000  z=+28.0000
+step    450  L=+11.8386  nce=+6.2174  inv=+0.1536  bkp=-0.0008  step=+1.4735  good=+0.3022  gap=+0.5098  above=+0.9519  spread=+0.3192  Q=+12.0000  z=+26.0000
+step    460  L=+11.4659  nce=+6.0563  inv=+0.1438  bkp=+0.0163  step=+1.4512  good=+0.3717  gap=+0.4257  above=+0.9538  spread=+0.4462  Q=+14.0000  z=+30.0000
+step    470  L=+11.5043  nce=+5.6718  inv=+0.1379  bkp=-0.0580  step=+1.5318  good=+0.3889  gap=+0.3215  above=+0.9464  spread=+0.4393  Q=+12.0000  z=+26.0000
+step    480  L=+11.9514  nce=+6.0272  inv=+0.1592  bkp=+0.0171  step=+1.6959  good=+0.5002  gap=-0.0385  above=+0.9665  spread=+0.9547  Q=+9.0000  z=+23.0000
+step    490  L=+10.5312  nce=+5.0064  inv=+0.2164  bkp=-0.1939  step=+1.2283  good=+0.3658  gap=+1.1320  above=+0.8540  spread=+0.7302  Q=+12.0000  z=+26.0000
+step    500  L=+11.2839  nce=+5.3576  inv=+0.1438  bkp=-0.0544  step=+1.2779  good=+0.5633  gap=+0.7406  above=+0.9830  spread=+0.9519  Q=+13.0000  z=+30.0000
+step    510  L=+11.8329  nce=+6.1700  inv=+0.1313  bkp=-0.0012  step=+1.5778  good=+0.3874  gap=+0.2151  above=+0.9813  spread=+0.3938  Q=+10.0000  z=+21.0000
+step    520  L=+11.5034  nce=+6.1127  inv=+0.1465  bkp=-0.0119  step=+1.3530  good=+0.3964  gap=+0.5210  above=+0.9958  spread=+0.3206  Q=+9.0000  z=+26.0000
+step    530  L=+10.9296  nce=+5.0577  inv=+0.1491  bkp=-0.0316  step=+1.3618  good=+0.6428  gap=+0.9082  above=+0.7433  spread=+0.7462  Q=+12.0000  z=+25.0000
+step    540  L=+11.4552  nce=+5.6367  inv=+0.1467  bkp=-0.0154  step=+1.4523  good=+0.4510  gap=+0.4405  above=+0.9486  spread=+0.7564  Q=+14.0000  z=+27.0000
+step    550  L=+10.7550  nce=+5.4076  inv=+0.1215  bkp=-0.1265  step=+1.4225  good=+0.2935  gap=+0.6619  above=+0.9430  spread=+0.4027  Q=+11.0000  z=+26.0000
+step    560  L=+11.1442  nce=+5.8207  inv=+0.1785  bkp=-0.0039  step=+1.3106  good=+0.3767  gap=+0.7072  above=+0.9322  spread=+0.5816  Q=+13.0000  z=+29.0000
+step    570  L=+12.2225  nce=+6.2245  inv=+0.1604  bkp=-0.0640  step=+1.5989  good=+0.5077  gap=+0.2138  above=+0.9537  spread=+0.5158  Q=+12.0000  z=+28.0000
+step    580  L=+11.7641  nce=+6.3327  inv=+0.1428  bkp=-0.0142  step=+1.5033  good=+0.3525  gap=+0.5699  above=+0.9677  spread=+0.2791  Q=+12.0000  z=+26.0000
+step    590  L=+11.5937  nce=+6.2146  inv=+0.1229  bkp=-0.0810  step=+1.3996  good=+0.3775  gap=+0.4755  above=+0.9491  spread=+0.3594  Q=+13.0000  z=+29.0000
+step    600  L=+10.5666  nce=+5.2113  inv=+0.1440  bkp=-0.1405  step=+1.4054  good=+0.1729  gap=+0.7922  above=+0.7043  spread=+0.2974  Q=+11.0000  z=+25.0000
+step    610  L=+11.0786  nce=+5.9632  inv=+0.1322  bkp=-0.1042  step=+1.4125  good=+0.3023  gap=+0.6400  above=+0.9479  spread=+0.2022  Q=+14.0000  z=+31.0000
+step    620  L=+11.9665  nce=+6.0377  inv=+0.1752  bkp=+0.0338  step=+1.5278  good=+0.4846  gap=+0.2341  above=+0.9406  spread=+0.3665  Q=+9.0000  z=+21.0000
+step    630  L=+11.5511  nce=+5.9125  inv=+0.1194  bkp=-0.0509  step=+1.4547  good=+0.3782  gap=+0.3766  above=+0.9716  spread=+0.4126  Q=+8.0000  z=+17.0000
+step    640  L=+11.4255  nce=+5.9713  inv=+0.1125  bkp=-0.0562  step=+1.4343  good=+0.4040  gap=+0.4823  above=+0.9400  spread=+0.5090  Q=+12.0000  z=+26.0000
+step    650  L=+11.0779  nce=+5.8804  inv=+0.1119  bkp=-0.1256  step=+1.2094  good=+0.3835  gap=+0.8401  above=+0.9547  spread=+0.4562  Q=+12.0000  z=+26.0000
+step    660  L=+11.4250  nce=+5.9217  inv=+0.1247  bkp=-0.1252  step=+1.4324  good=+0.4170  gap=+0.5316  above=+0.9261  spread=+0.7583  Q=+14.0000  z=+30.0000
+step    670  L=+10.8554  nce=+5.2558  inv=+0.1465  bkp=-0.1833  step=+1.2641  good=+0.3508  gap=+0.8721  above=+0.8325  spread=+0.4775  Q=+12.0000  z=+26.0000
+step    680  L=+10.5973  nce=+5.4625  inv=+0.1205  bkp=-0.1561  step=+1.2948  good=+0.5272  gap=+0.6616  above=+0.9412  spread=+0.7051  Q=+13.0000  z=+28.0000
+step    690  L=+11.1160  nce=+5.7528  inv=+0.1344  bkp=-0.0719  step=+1.3622  good=+0.3399  gap=+0.6957  above=+0.8812  spread=+0.4696  Q=+14.0000  z=+29.0000
+step    700  L=+10.9268  nce=+5.4792  inv=+0.1480  bkp=-0.1938  step=+0.9608  good=+0.2429  gap=+1.5514  above=+0.7557  spread=+0.4355  Q=+12.0000  z=+27.0000
+step    710  L=+10.1375  nce=+5.0441  inv=+0.1379  bkp=-0.1852  step=+1.3141  good=+0.2606  gap=+0.9559  above=+0.7170  spread=+0.3866  Q=+11.0000  z=+20.0000
+step    720  L=+11.0829  nce=+5.6991  inv=+0.1264  bkp=-0.1148  step=+1.4659  good=+0.3613  gap=+0.4960  above=+0.9394  spread=+0.5394  Q=+15.0000  z=+28.0000
+step    730  L=+11.5186  nce=+6.2216  inv=+0.1368  bkp=-0.0694  step=+1.3605  good=+0.3165  gap=+0.6952  above=+0.9371  spread=+0.3490  Q=+14.0000  z=+28.0000
+step    740  L=+11.4863  nce=+5.8781  inv=+0.1238  bkp=-0.1289  step=+1.5752  good=+0.3742  gap=+0.4242  above=+0.9133  spread=+0.4724  Q=+13.0000  z=+27.0000
+step    750  L=+10.4881  nce=+4.9250  inv=+0.1113  bkp=-0.1180  step=+1.4722  good=+0.4429  gap=+0.4320  above=+0.8763  spread=+0.8626  Q=+7.0000  z=+16.0000
+step    760  L=+11.2501  nce=+5.7497  inv=+0.1035  bkp=-0.1109  step=+1.1414  good=+0.6414  gap=+1.0052  above=+0.9337  spread=+0.7177  Q=+7.0000  z=+19.0000
+step    770  L=+11.0084  nce=+5.9058  inv=+0.1436  bkp=-0.1031  step=+1.1303  good=+0.3392  gap=+1.1372  above=+0.9452  spread=+0.5415  Q=+15.0000  z=+31.0000
+step    780  L=+9.5646  nce=+5.3227  inv=+0.1384  bkp=-0.2926  step=+0.9269  good=+0.2453  gap=+1.9045  above=+0.8131  spread=+0.4746  Q=+11.0000  z=+26.0000
+step    790  L=+10.6635  nce=+5.5595  inv=+0.1263  bkp=-0.2643  step=+1.3565  good=+0.3462  gap=+0.8292  above=+0.8724  spread=+0.5639  Q=+11.0000  z=+25.0000
+step    800  L=+10.4061  nce=+5.5891  inv=+0.1177  bkp=-0.2276  step=+0.9669  good=+0.2374  gap=+1.8467  above=+0.8782  spread=+0.2769  Q=+13.0000  z=+27.0000
+step    810  L=+11.2643  nce=+5.5482  inv=+0.1139  bkp=-0.2344  step=+1.4944  good=+0.4377  gap=+0.6238  above=+0.8865  spread=+0.5107  Q=+13.0000  z=+27.0000
+step    820  L=+10.7211  nce=+5.6504  inv=+0.1311  bkp=-0.2802  step=+1.2280  good=+0.2588  gap=+1.0533  above=+0.8497  spread=+0.3906  Q=+13.0000  z=+27.0000
+step    830  L=+10.7720  nce=+5.7529  inv=+0.1233  bkp=-0.3574  step=+1.1652  good=+0.3022  gap=+1.0112  above=+0.8639  spread=+0.4749  Q=+11.0000  z=+26.0000
+step    840  L=+10.9130  nce=+5.4669  inv=+0.1219  bkp=-0.1649  step=+1.3728  good=+0.3033  gap=+0.8039  above=+0.8842  spread=+0.5202  Q=+14.0000  z=+29.0000
+step    850  L=+11.6871  nce=+6.1795  inv=+0.1088  bkp=-0.1293  step=+1.3997  good=+0.4361  gap=+0.4871  above=+0.9574  spread=+0.7200  Q=+12.0000  z=+25.0000
+step    860  L=+11.3971  nce=+6.2664  inv=+0.1129  bkp=-0.1426  step=+1.5249  good=+0.4471  gap=+0.3007  above=+0.9322  spread=+0.6863  Q=+12.0000  z=+27.0000
+step    870  L=+11.1648  nce=+5.9963  inv=+0.1068  bkp=-0.1456  step=+1.1992  good=+0.4678  gap=+0.7502  above=+0.9591  spread=+0.6683  Q=+10.0000  z=+24.0000
+step    880  L=+10.1018  nce=+5.3666  inv=+0.1235  bkp=-0.2800  step=+1.2876  good=+0.2439  gap=+1.1266  above=+0.8604  spread=+0.4749  Q=+12.0000  z=+28.0000
+step    890  L=+10.8935  nce=+5.8747  inv=+0.1078  bkp=-0.2624  step=+1.2740  good=+0.3139  gap=+0.8737  above=+0.8790  spread=+0.6272  Q=+12.0000  z=+26.0000
+step    900  L=+11.5395  nce=+6.1434  inv=+0.1027  bkp=-0.1633  step=+1.3961  good=+0.4417  gap=+0.6046  above=+0.9509  spread=+0.6446  Q=+13.0000  z=+29.0000
+step    910  L=+11.1464  nce=+5.9477  inv=+0.1013  bkp=-0.1475  step=+1.4062  good=+0.5643  gap=+0.3477  above=+0.9657  spread=+0.6938  Q=+9.0000  z=+23.0000
+step    920  L=+9.3116  nce=+4.9522  inv=+0.1049  bkp=-0.2180  step=+0.8988  good=+0.2732  gap=+1.8390  above=+0.8075  spread=+0.4469  Q=+11.0000  z=+24.0000
+step    930  L=+7.3682  nce=+5.5003  inv=+0.0995  bkp=-0.2272  step=+1.4644  good=+0.3495  gap=+0.7444  above=+0.8627  spread=+0.4782  Q=+11.0000  z=+25.0000
+step    940  L=+10.9823  nce=+5.6105  inv=+0.0922  bkp=-0.1967  step=+1.2680  good=+0.1975  gap=+1.2818  above=+0.8219  spread=+0.2856  Q=+13.0000  z=+26.0000
+step    950  L=+11.3669  nce=+5.9128  inv=+0.0896  bkp=-0.1868  step=+1.5480  good=+0.4450  gap=+0.3581  above=+0.8872  spread=+0.5162  Q=+12.0000  z=+27.0000
+step    960  L=+9.3889  nce=+5.0424  inv=+0.1008  bkp=-0.3119  step=+0.7856  good=+0.3003  gap=+2.0267  above=+0.7636  spread=+0.5934  Q=+11.0000  z=+23.0000
+step    970  L=+10.3671  nce=+5.4557  inv=+0.0970  bkp=-0.2524  step=+1.2175  good=+0.2195  gap=+1.3200  above=+0.8154  spread=+0.4482  Q=+11.0000  z=+27.0000
+step    980  L=+10.5519  nce=+5.9118  inv=+0.0917  bkp=-0.2186  step=+1.2286  good=+0.2779  gap=+0.9426  above=+0.9284  spread=+0.4133  Q=+13.0000  z=+25.0000
+step    990  L=+11.7381  nce=+6.1366  inv=+0.0864  bkp=-0.0797  step=+1.5502  good=+0.3574  gap=+0.2588  above=+0.9454  spread=+0.6795  Q=+12.0000  z=+24.0000
+[modal-client] 2026-08-22T02:04:17+0000 Received a cancellation signal while processing input ('in-01M0KE9PE0YB5N2Y0S4S617V87:1787358927298-0',)
+[modal-client] 2026-08-22T02:04:19+0000 Successfully canceled input ('in-01M0KE9PE0YB5N2Y0S4S617V87:1787358927298-0',)
+╭───────────────────── Traceback (most recent call last) ──────────────────────╮
+│ /Users/macos/machinelearning/feynman_reasoning/feynman-prm/modal_cf_lam2_tau │
+│ 005.py:399 in main                                                           │
+│                                                                              │
+│   398 │   print("\n=== stages 1-4: train + ProcessBench (A100 40 GB, ~4.2 h) │
+│ ❱ 399 │   summary = train_and_eval.remote(skip_phase2_below=skip_phase2_belo │
+│   400 │   print("\n=== summary ===")                                         │
+│                                                                              │
+│ /Users/macos/machinelearning/feynman_reasoning/.venv/lib/python3.12/site-pac │
+│ kages/modal/_object.py:46 in wrapped                                         │
+│                                                                              │
+│    45 │   │   await self.hydrate()                                           │
+│ ❱  46 │   │   return await method(self, *args, **kwargs)                     │
+│    47                                                                        │
+│                                                                              │
+│ /Users/macos/machinelearning/feynman_reasoning/.venv/lib/python3.12/site-pac │
+│ kages/modal/_functions.py:1841 in remote                                     │
+│                                                                              │
+│   1840 │   │                                                                 │
+│ ❱ 1841 │   │   return await self._call_function(args, kwargs)                │
+│   1842                                                                       │
+│                                                                              │
+│ /Users/macos/machinelearning/feynman_reasoning/.venv/lib/python3.12/site-pac │
+│ kages/modal/_functions.py:1778 in _call_function                             │
+│                                                                              │
+│   1777 │   │                                                                 │
+│ ❱ 1778 │   │   return await invocation.run_function()                        │
+│   1779                                                                       │
+│                                                                              │
+│ /Users/macos/machinelearning/feynman_reasoning/.venv/lib/python3.12/site-pac │
+│ kages/modal/_functions.py:483 in run_function                                │
+│                                                                              │
+│    482 │   │   │   if await_response.output.result.status in TERMINAL_STATUS │
+│ ❱  483 │   │   │   │   return await _process_result(                         │
+│    484 │   │   │   │   │   await_response.output.result, await_response.outp │
+│                                                                              │
+│ /Users/macos/machinelearning/feynman_reasoning/.venv/lib/python3.12/site-pac │
+│ kages/modal/_utils/function_utils.py:574 in _process_result                  │
+│                                                                              │
+│   573 │   │                                                                  │
+│ ❱ 574 │   │   raise RemoteError(result.exception)                            │
+│   575                                                                        │
+╰──────────────────────────────────────────────────────────────────────────────╯
+RemoteError: Function call was cancelled by user or a failure.
