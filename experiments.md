@@ -4,9 +4,6 @@
 A process reward model that scores a reasoning step by a learned quasimetric distance —
 what was tried, why, what it scored, and how each attempt failed.
 
-*Compiled 2026-08-29. Sources: `CLAUDE.md` (§9, §14, §18), `CLAUDE2.md`, `runs/*/RESULT.md`,
-`runs/*/{config.resolved.yaml, events.jsonl, val_f1.json, processbench.json}`, and the
-`unrealparticles-iit-roor/feynman-prm` W&B project.*
 
 ---
 
