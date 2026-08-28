@@ -16,9 +16,22 @@ losses, and its known open failure is that the ruler decays (`backup/delta_mean`
 `-log gamma`, IMPLEMENTATION.md §9). QRL replaces the soft ruler with a CONSTRAINT: maximize
 distances everywhere, subject to Lagrangian constraints that hold the known-small ones down.
 So none of (1) L_NCE, (2) L_I, (3) L_T, (4) L_CF, (5) L_step, (6) L_good, (7) L_term is
-computed here. The loss set is three terms and two dual variables:
+computed here. The loss set is six terms and three dual variables:
 
-    L = push  +  lambda_local * (local violation)  +  lambda_cf * (CF violation)
+    L = push  +  cf_neg_push_weight     * (CF negatives away from GOALS)
+             +  cf_pos_neg_push_weight * (CF negatives away from their own CLASS)
+             +  lambda_local * (k = 1 violation)
+             +  lambda_path  * (2 <= k <= path_max_gap violation)
+             +  lambda_cf    * (CF violation)
+
+Two of those are deliberate divergences from upstream, labelled as such wherever they appear.
+The PATH constraint extends upstream's local constraint from adjacent transitions to every
+observed sub-path -- `d(s_i, s_j) <= (j - i) * step_cost` -- but the k = 1 rows keep their own
+mean and their own dual variable, because a one-sided constraint pooled over a wide mostly-slack
+set dilutes exactly the rows the run is steered by (loss.py §2 has the measurement). And CF
+negatives are pushed away from the anchor and positives of their own example, in both
+directions: the CF constraint says a REWORDED step is the same point, and nothing else says a
+BROKEN one is a different point.
 
 Why a sibling package rather than a module inside `feynman_prm/`: the same reason
 `pqm_baseline/` is one (see its README §3). The objective is a REPLACEMENT for the method's

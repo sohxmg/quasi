@@ -196,7 +196,11 @@ def _constraint_footer(run_dir: str | None) -> None:
     """The two curves that say whether the objective took, read off the run's last metrics line.
 
     `qrl/local_dist_mean` is THE ruler and should sit near `step_cost`; that is the direct
-    answer to IMPLEMENTATION.md §9's decaying ruler. `qrl/lagrange_cf` climbing while
+    answer to IMPLEMENTATION.md §9's decaying ruler. `qrl/path_ratio_mean` is the same
+    quantity at k >= 2, so the two are read together: the ruler near 1.0 with the ratio far
+    above it means the metric satisfies the adjacent steps and still lets observed sub-paths
+    blow out -- which is the leak the k >= 2 constraint exists to price, and the reason its
+    multiplier is separate. `qrl/lagrange_cf` climbing while
     `qrl/cf_sq_dev` did not fall means the CF corpus contradicts itself -- the dual variable
     is the data-quality detector, and it belongs next to the F1 numbers, not in a separate
     conversation.
@@ -222,14 +226,20 @@ def _constraint_footer(run_dir: str | None) -> None:
     print(f"\nconstraints at the last logged step ({last.get('step')})")
     for key, target in (
         ("qrl/local_dist_mean", step_cost),
+        ("qrl/local_over_cost_frac", 0.0),
         ("qrl/local_violation", 0.0),
         ("qrl/lagrange_local", None),
+        ("qrl/path_ratio_mean", step_cost),
+        ("qrl/path_violation", 0.0),
+        ("qrl/lagrange_path", None),
         ("qrl/cf_sq_dev", (knobs.get("_derived") or {}).get("cf_target")),
         ("qrl/cf_violation", 0.0),
         ("qrl/cf_p95", knobs.get("epsilon_cf")),
         ("qrl/lagrange_cf", None),
         ("qrl/push_dist_mean", None),
         ("qrl/push_saturated_frac", None),
+        ("qrl/pos_neg_push_dist_mean", None),
+        ("qrl/pos_neg_push_gap", None),
     ):
         if key not in last:
             continue

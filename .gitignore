@@ -1,4 +1,9 @@
+# Working notes that are mine, not the repo's: the locked spec, its session addendum and the
+# implementation log. They are the record of how decisions were made, not something a reader
+# of this repo needs. `experiments.md` is the shareable version and stays tracked.
 CLAUDE.md
+CLAUDE2.md
+experiments_runlog.md
 PLAN.md
 .env
 __pycache__/

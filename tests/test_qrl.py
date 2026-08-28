@@ -35,11 +35,17 @@ from qrl_prm.lagrange import (
 from qrl_prm.cf_encode import CF_ENCODE_KEYS, CFEncodeContext, empty_encode_info
 from qrl_prm.loss import (
     _CF_KEYS,
+    _LOCAL_KEYS,
+    _PATH_KEYS,
     _empty_cf_info,
     anchor_of_example,
     cf_terms,
     expected_init_values,
+    local_pairs,
     local_violation,
+    path_pairs,
+    path_violation,
+    traj_pairs,
     push_masks,
     push_term,
     qrl_loss,
@@ -94,9 +100,9 @@ def goals_for(batch, seed: int = 0):
 
 
 def test_softplus_inv_round_trips_so_init_lagrange_means_the_multiplier():
-    """`init_lagrange: 0.01` is the MULTIPLIER's value, not the raw scalar's. Storing 0.01 raw
-    would start the multiplier at softplus(0.01) = 0.698 -- 70x high, and nothing downstream
-    would say so."""
+    """`init_lagrange_cf: 0.01` is the MULTIPLIER's value, not the raw scalar's. Storing 0.01
+    raw would start the multiplier at softplus(0.01) = 0.698 -- 70x high, and nothing
+    downstream would say so. The sweep spans both inits this run uses, 0.01 and 1.5."""
     for value in (0.001, 0.01, 0.5, 3.0, 25.0):
         m = LagrangeMultiplier(value)
         assert float(m.value) == pytest.approx(value, rel=1e-5)
@@ -144,50 +150,316 @@ def test_the_primal_still_descends_the_violation():
 
 
 # =======================================================================================
-# 2. the local constraint
+# 2. the two sub-path constraints -- k = 1 (local) and 2 <= k <= path_max_gap (path)
 # =======================================================================================
 
 
-def test_local_constraint_is_zero_at_exactly_step_cost(batch, qrl):
+def test_local_pairs_are_exactly_the_observed_transitions(batch):
+    """`row_src -> row_dst` is upstream's local constraint. `local_pairs` derives the same set
+    from the `(S, S)` step mask instead, so this is a genuine cross-check on the mask and not
+    a restatement of the edge list."""
+    src, dst, gap = local_pairs(batch)
+    got = {(int(a), int(b)) for a, b in zip(src, dst)}
+    want = {(int(a), int(b)) for a, b in zip(batch.row_src, batch.row_dst)}
+    assert got == want
+    assert len(got) == batch.n_rows == 12
+    assert bool((gap == 1).all())
+
+
+def test_local_and_path_pair_sets_partition_the_forward_pairs(batch, qrl):
+    """THE SPLIT, pinned. The two constraints must be DISJOINT -- that is what makes two
+    multipliers legal rather than one constraint counted twice -- and together they must lose
+    nothing inside the cap. A `path` set that still held k = 1 is the merge coming back."""
+    l_src, l_dst, _ = local_pairs(batch)
+    p_src, p_dst, p_gap = path_pairs(batch, qrl)
+    local = {(int(a), int(b)) for a, b in zip(l_src, l_dst)}
+    path = {(int(a), int(b)) for a, b in zip(p_src, p_dst)}
+    assert local & path == set()
+    assert bool((p_gap >= 2).all())
+
+    full_src, full_dst, full_gap = traj_pairs(batch, min_gap=1, max_gap=qrl.path_max_gap)
+    full = {(int(a), int(b)) for a, b in zip(full_src, full_dst)}
+    assert local | path == full
+    assert len(local) + len(path) == len(full)          # no pair in both
+
+
+def test_path_max_gap_one_makes_the_path_set_empty(batch):
+    """The local-only ablation. `path_max_gap = 1` asks for `2 <= k <= 1`, which is empty on
+    purpose, and it must take the exact-zero path rather than raising."""
+    psi = ladder_psi(batch, gap=2.0)
+    k1_only = QRLConfig(path_max_gap=1)
+    assert path_pairs(batch, k1_only)[0].numel() == 0
+    viol, d, info = path_violation(psi, batch, DirectedDistance(), k1_only)
+    assert float(viol) == 0.0                            # NOT -path_target: no data is not
+    assert d.numel() == 0                                # evidence of satisfaction
+    assert info["qrl/path_pairs"] == 0.0
+    assert set(info) == set(_PATH_KEYS)                  # keys never disappear
+    # and the local constraint is untouched by the cap
+    assert local_violation(psi, batch, DirectedDistance(), k1_only)[2][
+        "qrl/local_transitions"
+    ] == float(batch.n_rows)
+
+
+def test_pairs_are_forward_only_and_within_one_trajectory(batch, qrl):
+    """`d` is a QUASImetric: there is no observed path back up a reasoning trace, so
+    d(s_j, s_i) for j > i SHOULD be large and constraining it would assert the opposite.
+    Cross-trajectory pairs have no observed path at all, in either direction."""
+    for src, dst, gap in (local_pairs(batch), path_pairs(batch, qrl)):
+        assert bool((gap >= 1).all())
+        assert bool((batch.state_step[dst] - batch.state_step[src] == gap).all())
+        assert bool((batch.state_traj[src] == batch.state_traj[dst]).all())
+    # uncapped, every trajectory contributes T(T+1)/2 forward pairs over its T+1 states
+    src, _, _ = traj_pairs(batch, min_gap=1, max_gap=0)
+    assert src.numel() == sum(int(t) * (int(t) + 1) // 2 for t in batch.traj_T)
+
+
+def test_local_constraint_is_upstreams_expression(batch, qrl):
+    """`losses/local_constraint.py:56-59`, by hand: same pairs, same target, same order."""
+    psi = ladder_psi(batch, gap=2.0)
+    viol, d, info = local_violation(psi, batch, DirectedDistance(), qrl)
+    want = (
+        (DirectedDistance()(psi[batch.row_src], psi[batch.row_dst]) - qrl.step_cost)
+        .relu()
+        .square()
+        .mean()
+        - qrl.local_target
+    )
+    assert float(viol) == pytest.approx(float(want), rel=1e-6)
+    assert info["qrl/local_dist_mean"] == pytest.approx(2.0)
+    assert info["qrl/local_over_cost_frac"] == 1.0
+    assert info["qrl/local_transitions"] == float(batch.n_rows)
+
+
+def test_local_constraint_is_zero_when_every_step_costs_step_cost(batch, qrl):
     psi = ladder_psi(batch, gap=qrl.step_cost)
-    viol, d_step, info = local_violation(psi, batch, DirectedDistance(), qrl)
+    viol, _, info = local_violation(psi, batch, DirectedDistance(), qrl)
     assert info["qrl/local_dist_mean"] == pytest.approx(qrl.step_cost)
     assert info["qrl/local_sq_dev"] == pytest.approx(0.0, abs=1e-6)
     assert float(viol) == pytest.approx(-qrl.local_target)
 
 
-def test_local_constraint_is_one_sided(batch, qrl):
-    """A transition SHORTER than one step is free (`(d - step_cost).relu()`). The push term is
-    what stops everything collapsing to zero; the constraint never pulls upward."""
+def test_path_constraint_is_zero_when_every_gap_costs_its_step_count(batch, qrl):
+    """`ladder_psi(gap=1)` puts d(s_i, s_j) at exactly `j - i` under `DirectedDistance`, so
+    the ladder is feasible at EVERY k -- which is what makes it the right fixture for a
+    constraint whose target is per-pair."""
+    psi = ladder_psi(batch, gap=qrl.step_cost)
+    viol, d, info = path_violation(psi, batch, DirectedDistance(), qrl)
+    assert info["qrl/path_ratio_mean"] == pytest.approx(qrl.step_cost)
+    assert info["qrl/path_sq_dev"] == pytest.approx(0.0, abs=1e-6)
+    assert float(viol) == pytest.approx(-qrl.path_target)
+    # the mean DISTANCE is not the ruler in this set -- the RATIO is
+    assert info["qrl/path_dist_mean"] > qrl.step_cost
+    assert info["qrl/path_gap_max"] == float(qrl.path_max_gap)
+
+
+def test_path_constraint_target_scales_with_the_gap(batch, qrl):
+    """`k * step_cost`, not `step_cost`. A gap-3 pair measuring 3.0 is exactly on budget; if
+    the target were flat it would read as a deviation of 2.0 and the constraint would be
+    asserting that the whole observed sub-path is one step long."""
+    psi = ladder_psi(batch, gap=qrl.step_cost)
+    _, d, _ = path_violation(psi, batch, DirectedDistance(), qrl)
+    _, _, gap = path_pairs(batch, qrl)
+    assert torch.allclose(d.detach(), gap.float() * qrl.step_cost, atol=1e-5)
+
+
+def test_both_constraints_are_one_sided(batch, qrl):
+    """A sub-path measured SHORTER than its observed step count is free, at k = 1 and above.
+    That is not slack: the observed trace need not be the shortest path between its own
+    endpoints, and penalising `d < k` would assert that it is. The push term is what stops
+    everything collapsing to zero; neither constraint ever pulls upward."""
     psi = ladder_psi(batch, gap=0.25 * qrl.step_cost)
-    _, _, info = local_violation(psi, batch, DirectedDistance(), qrl)
-    assert info["qrl/local_dist_mean"] == pytest.approx(0.25)
-    assert info["qrl/local_sq_dev"] == 0.0
-    assert info["qrl/local_over_cost_frac"] == 0.0
+    _, _, l_info = local_violation(psi, batch, DirectedDistance(), qrl)
+    _, _, p_info = path_violation(psi, batch, DirectedDistance(), qrl)
+    assert l_info["qrl/local_sq_dev"] == 0.0
+    assert l_info["qrl/local_over_cost_frac"] == 0.0
+    assert p_info["qrl/path_ratio_mean"] == pytest.approx(0.25)
+    assert p_info["qrl/path_sq_dev"] == 0.0
+    assert p_info["qrl/path_over_cost_frac"] == 0.0
 
 
-def test_local_constraint_squares_before_it_means(batch, qrl):
-    """`mean(relu(d - c)^2)`, NOT `mean(relu(d - c))^2` -- QRL's own order
+def test_both_constraints_square_before_they_mean(batch, qrl):
+    """`mean(relu(d - t)^2)`, NOT `mean(relu(d - t))^2` -- QRL's own order
     (`local_constraint.py:59`). The two agree only when every deviation is equal, which is
-    exactly the fixture a careless test would use.
-    """
-    # Two trajectories at gap 1 (deviation 0) and two at gap 3 (deviation 2).
+    exactly the fixture a careless test would use; here the deviation varies with k and
+    across trajectories."""
     psi = torch.zeros(batch.n_states, D)
     fast = torch.isin(batch.state_traj, torch.tensor([2, 3]))
     gap = torch.where(fast, 3.0, 1.0)
     psi[:, 0] = -gap * batch.state_step.float()
     psi.requires_grad_(True)
 
-    _, d_step, info = local_violation(psi, batch, DirectedDistance(), qrl)
-    dev = (d_step.detach() - qrl.step_cost).relu()
-    assert info["qrl/local_sq_dev"] == pytest.approx(float(dev.square().mean()))
-    assert info["qrl/local_sq_dev"] != pytest.approx(float(dev.mean()) ** 2)
+    _, d, info = path_violation(psi, batch, DirectedDistance(), qrl)
+    _, _, k = path_pairs(batch, qrl)
+    dev = (d.detach() - k.float() * qrl.step_cost).relu()
+    assert info["qrl/path_sq_dev"] == pytest.approx(float(dev.square().mean()))
+    assert info["qrl/path_sq_dev"] != pytest.approx(float(dev.mean()) ** 2)
+
+    _, ld, linfo = local_violation(psi, batch, DirectedDistance(), qrl)
+    ldev = (ld.detach() - qrl.step_cost).relu()
+    assert linfo["qrl/local_sq_dev"] == pytest.approx(float(ldev.square().mean()))
+    assert linfo["qrl/local_sq_dev"] != pytest.approx(float(ldev.mean()) ** 2)
 
 
-def test_local_constraint_covers_incorrect_trajectories_too(batch, qrl):
-    """Every observed transition, correct AND incorrect: a step is an observed step whatever
-    its verdict, and a metric that cannot measure the wrong ones cannot score them either."""
+def test_the_wide_set_cannot_dilute_the_ruler(batch, qrl):
+    """WHY THE CONSTRAINTS ARE SPLIT, pinned as arithmetic rather than as prose.
+
+    A psi whose adjacent steps are on budget while its longer gaps blow out. Under one pooled
+    mean the k = 1 rows would be a minority of the denominator and the violation they carry
+    would be averaged away; split, `local_sq_dev` is computed over the transitions ALONE and
+    is exactly what upstream's constraint would report. That number is what `lambda_local`
+    integrates, and it must not move when the k >= 2 set changes size.
+    """
+    psi = torch.zeros(batch.n_states, D)
+    # d(s_i, s_j) = (j - i) + 2 * (j^2 - i^2): adjacent steps stay near 1, long gaps explode.
+    step = batch.state_step.float()
+    psi[:, 0] = -(step + 2.0 * step.square())
+    psi.requires_grad_(True)
+
+    _, ld, linfo = local_violation(psi, batch, DirectedDistance(), qrl)
+    _, pd, pinfo = path_violation(psi, batch, DirectedDistance(), qrl)
+
+    # the ruler is the transitions and nothing else
+    assert linfo["qrl/local_transitions"] == float(batch.n_rows)
+    assert linfo["qrl/local_dist_mean"] == pytest.approx(float(ld.detach().mean()))
+    assert linfo["qrl/local_sq_dev"] == pytest.approx(
+        float((ld.detach() - qrl.step_cost).relu().square().mean())
+    )
+    # the k >= 2 rows are a different, larger set carrying a much larger deviation ...
+    assert pinfo["qrl/path_pairs"] > 0
+    assert pinfo["qrl/path_sq_dev"] > linfo["qrl/local_sq_dev"]
+    # ... and widening it leaves the ruler bit-identical
+    for cap in (2, 3, 0):
+        wider = QRLConfig(path_max_gap=cap)
+        assert path_violation(psi, batch, DirectedDistance(), wider)[2]["qrl/path_pairs"] > 0
+        again = local_violation(psi, batch, DirectedDistance(), wider)[2]
+        assert again == linfo
+
+
+def test_path_gaps_match_the_walked_transition_graph(batch, qrl):
+    """`k` derived a SECOND way, from the transition graph rather than from `state_step`.
+
+    `traj_pairs` reads `state_step` and `state_traj`; this walks `row_src -> row_dst` instead,
+    counting edges, and never touches either. So it is a genuine cross-check on the quantity
+    the constraint's target is built from, not a restatement of it: if the (S, S) broadcast
+    were transposed, or `nonzero`'s row/column order were swapped, or `gap` were gathered with
+    indices from a different mask, this fails and the arithmetic ones do not.
+    """
+    succ = {int(a): int(b) for a, b in zip(batch.row_src, batch.row_dst)}
+    has_pred = {int(b) for b in batch.row_dst}
+
+    truth = {}
+    for start in (s for s in range(batch.n_states) if s not in has_pred):
+        chain, s = [start], start
+        while s in succ:
+            s = succ[s]
+            chain.append(s)
+        for a in range(len(chain)):
+            for b in range(a + 1, len(chain)):
+                truth[(chain[a], chain[b])] = b - a      # hops, by construction
+
+    src, dst, gap = traj_pairs(batch, min_gap=1, max_gap=0)
+    got = {(int(a), int(b)): int(k) for a, b, k in zip(src, dst, gap)}
+    assert len(got) == src.numel()                       # no pair emitted twice
+    assert got == truth                                  # same pairs AND the same k on each
+
+    # and each constraint takes its own slice of exactly that
+    l_src, l_dst, _ = local_pairs(batch)
+    assert {(int(a), int(b)) for a, b in zip(l_src, l_dst)} == {
+        p for p, k in truth.items() if k == 1
+    }
+    p_src, p_dst, _ = path_pairs(batch, qrl)
+    assert {(int(a), int(b)) for a, b in zip(p_src, p_dst)} == {
+        p for p, k in truth.items() if 2 <= k <= qrl.path_max_gap
+    }
+
+
+def test_path_target_is_per_pair_and_not_a_flat_step_cost(batch, qrl):
+    """The target is `k * step_cost`, and `k` is THIS pair's gap.
+
+    A flat `step_cost` target would still make every arithmetic identity in this file hold at
+    k = 1, which is most of the suite -- so it is pinned directly, against a psi whose
+    distances differ pair by pair, by recomputing the violation in plain Python and by
+    checking the flat-target value is a different number.
+    """
+    torch.manual_seed(21)
+    psi = torch.randn(batch.n_states, D, requires_grad=True)
+    dist = DirectedDistance()
+    viol, d, info = path_violation(psi, batch, dist, qrl)
+    src, dst, gap = path_pairs(batch, qrl)
+
+    by_hand = sum(
+        max(0.0, float(dist(psi[int(a)], psi[int(b)])) - int(k) * qrl.step_cost) ** 2
+        for a, b, k in zip(src, dst, gap)
+    ) / d.numel() - qrl.path_target
+    assert float(viol) == pytest.approx(by_hand, abs=1e-5)
+
+    flat = sum(
+        max(0.0, float(dist(psi[int(a)], psi[int(b)])) - qrl.step_cost) ** 2
+        for a, b in zip(src, dst)
+    ) / d.numel() - qrl.path_target
+    assert abs(flat - by_hand) > 1e-3                    # k really varies across the pairs
+
+    # and the DIAGNOSTICS divide by the same per-pair target, not by step_cost
+    dd, tt = d.detach(), gap.float() * qrl.step_cost
+    assert info["qrl/path_ratio_mean"] == pytest.approx(float((dd / tt).mean()), rel=1e-6)
+    assert info["qrl/path_over_cost_frac"] == pytest.approx(float((dd > tt).float().mean()))
+    assert info["qrl/path_ratio_mean"] != pytest.approx(float((dd / qrl.step_cost).mean()))
+
+
+def test_path_deviation_scales_with_the_gap_not_with_the_pair_count(batch, qrl):
+    """A ruler 1.5x too long overshoots by `0.5 * k` at gap k, not by a flat 0.5. This is the
+    whole reason the k >= 2 rows exist: a leak in the adjacent steps compounds along the
+    trace, and a flat target would report it as if it did not."""
+    psi = ladder_psi(batch, gap=1.5 * qrl.step_cost)
+    _, _, info = path_violation(psi, batch, DirectedDistance(), qrl)
+    _, _, gap = path_pairs(batch, qrl)
+    assert info["qrl/path_sq_dev"] == pytest.approx(
+        float((0.5 * gap.float()).square().mean()), rel=1e-5
+    )
+    assert info["qrl/path_ratio_mean"] == pytest.approx(1.5)          # per-step cost is flat
+    assert info["qrl/path_dist_max"] == pytest.approx(1.5 * float(gap.max()))
+
+
+def test_path_deviation_is_absolute_and_not_per_step(batch, qrl):
+    """ABSOLUTE, not `((d - k*c).relu() / k)^2`. The per-step form was considered and not
+    taken (`path_max_gap` in config.py says why), and the two differ on any fixture where the
+    gap varies -- so the choice is pinned rather than left to a comment."""
+    psi = ladder_psi(batch, gap=1.5 * qrl.step_cost)
+    _, d, info = path_violation(psi, batch, DirectedDistance(), qrl)
+    _, _, gap = path_pairs(batch, qrl)
+    dev = (d.detach() - gap.float() * qrl.step_cost).relu()
+    per_step = float((dev / gap.float()).square().mean())
+    assert info["qrl/path_sq_dev"] == pytest.approx(float(dev.square().mean()), rel=1e-5)
+    assert info["qrl/path_sq_dev"] != pytest.approx(per_step)
+    assert info["qrl/path_sq_dev"] > per_step            # long gaps carry more, as designed
+
+
+def test_path_max_gap_leaves_k_untouched_on_the_pairs_it_keeps(batch):
+    """A cap must filter the pair set, never renumber it. `path_max_gap = G` has to be exactly
+    the `2 <= k <= G` subset of the uncapped set, same k on every survivor."""
+    src, dst, gap = path_pairs(batch, QRLConfig(path_max_gap=0))
+    full = {(int(a), int(b)): int(k) for a, b, k in zip(src, dst, gap)}
+    assert min(full.values()) == 2
+    for cap in (2, 3, 5):
+        s, d, g = path_pairs(batch, QRLConfig(path_max_gap=cap))
+        sub = {(int(a), int(b)): int(k) for a, b, k in zip(s, d, g)}
+        assert sub == {p: k for p, k in full.items() if k <= cap}
+
+
+def test_path_max_gap_caps_the_pair_set(batch):
+    src_all, _, _ = path_pairs(batch, QRLConfig(path_max_gap=0))
+    src_2, _, gap_2 = path_pairs(batch, QRLConfig(path_max_gap=2))
+    assert int(gap_2.max()) == 2
+    assert src_2.numel() < src_all.numel()
+
+
+def test_constraints_cover_incorrect_trajectories_too(batch, qrl):
+    """Every observed pair, on correct AND incorrect trajectories: a step is an observed step
+    whatever its verdict, and a metric that cannot measure the wrong ones cannot score them
+    either."""
     psi = ladder_psi(batch)
+    for src, _, _ in (local_pairs(batch), path_pairs(batch, qrl)):
+        assert {int(t) for t in batch.state_traj[src].unique()} == {0, 1, 2, 3}
     _, _, info = local_violation(psi, batch, DirectedDistance(), qrl)
     assert info["qrl/local_transitions"] == float(batch.n_rows) == 12.0
 
@@ -244,7 +516,7 @@ def test_the_hub_is_the_example_s_own_anchor_never_a_batch_state(batch, qrl):
     # both examples depart from state 0; anchors at 0 and 10, positives one unit above each
     cf = make_cf(batch, [0, 0, 0, 0], [0, 1, 0, 1], [0.0, 1.0, 10.0, 11.0])
     cf = (cf[0], cf[1], torch.tensor([0, 0, 1, 1]), cf[3])
-    _, _, info = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, cf)
+    _, _, _, info = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, cf)
     assert info["qrl/cf_examples"] == 2.0
     assert info["qrl/cf_pairs"] == 4.0                    # 2 positives x 2 directions
     # each positive measured against ITS OWN anchor: 1 unit backward, 0 forward, both classes
@@ -260,7 +532,7 @@ def test_a_variant_departing_from_a_terminal_is_no_longer_special(batch, qrl):
     psi_goal = psi.index_select(0, goals.goal_state)
     goal_q = batch.traj_qid[goals.goal_traj]
     cf = make_cf(batch, states=[3, 3], kinds=[0, 1], values=[0.0, 1.0])
-    viol, _, info = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, cf)
+    viol, _, _, info = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, cf)
     assert info["qrl/cf_active"] == 1.0
     assert info["qrl/cf_pairs"] == 2.0
     assert float(viol) == pytest.approx(0.5 - qrl.cf_target)
@@ -278,7 +550,7 @@ def test_a_positive_whose_example_lost_its_anchor_is_dropped_and_counted(batch, 
     psi_goal = psi.index_select(0, goals.goal_state)
     goal_q = batch.traj_qid[goals.goal_traj]
     cf = make_cf(batch, states=[0, 0], kinds=[1, 1], values=[1.0, 2.0])   # no kind 0
-    viol, _, info = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, cf)
+    viol, _, _, info = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, cf)
     assert info["qrl/cf_positives"] == 2.0
     assert info["qrl/cf_anchor_missing"] == 2.0
     assert info["qrl/cf_active"] == 0.0
@@ -295,7 +567,7 @@ def test_cf_constraint_takes_both_directions(batch, qrl):
     psi_goal = psi.index_select(0, goals.goal_state)
     goal_q = batch.traj_qid[goals.goal_traj]
     cf = make_cf(batch, states=[0, 0], kinds=[0, 1], values=[0.0, 1.0])
-    viol, _, info = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, cf)
+    viol, _, _, info = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, cf)
     assert info["qrl/cf_dist_fwd_mean"] == pytest.approx(0.0)     # d(anchor, v) = relu(0 - 1)
     assert info["qrl/cf_dist_bwd_mean"] == pytest.approx(1.0)     # d(v, anchor) = relu(1 - 0)
     assert info["qrl/cf_sq_dev"] == pytest.approx(0.5)
@@ -313,8 +585,8 @@ def test_the_anchor_is_the_hub_and_is_never_its_own_pair(batch, qrl):
     goal_q = batch.traj_qid[goals.goal_traj]
     one = make_cf(batch, [0, 0], [0, 1], [0.0, 1.0])
     two = make_cf(batch, [0, 0, 0], [0, 1, 1], [0.0, 1.0, 1.0])
-    _, _, info_one = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, one)
-    _, _, info_two = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, two)
+    _, _, _, info_one = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, one)
+    _, _, _, info_two = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, two)
     assert info_one["qrl/cf_pairs"] == 2.0
     assert info_two["qrl/cf_pairs"] == 4.0
     assert info_two["qrl/cf_variants"] == 3.0
@@ -334,8 +606,8 @@ def test_cf_constraint_never_sees_negatives(batch, qrl):
 
     without = make_cf(batch, [0, 0], [0, 1], [0.0, 1.0])
     withneg = make_cf(batch, [0, 0, 0], [0, 1, 2], [0.0, 1.0, 50.0])
-    _, _, info_a = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, without)
-    _, _, info_b = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, withneg)
+    _, _, _, info_a = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, without)
+    _, _, _, info_b = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, withneg)
     assert info_a["qrl/cf_sq_dev"] == pytest.approx(info_b["qrl/cf_sq_dev"])
     assert info_b["qrl/cf_pairs"] == info_a["qrl/cf_pairs"] == 2.0   # 1 positive x 2 directions
     assert info_b["qrl/cf_negatives"] == 1.0
@@ -350,7 +622,7 @@ def test_cf_star_pairs_are_anchor_to_member_only_not_the_pairwise_grid(batch, qr
     psi_goal = psi.index_select(0, goals.goal_state)
     goal_q = batch.traj_qid[goals.goal_traj]
     cf = make_cf(batch, [0, 0, 0, 0], [0, 1, 1, 1], [0.0, 1.0, 2.0, 3.0])
-    _, _, info = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, cf)
+    _, _, _, info = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, cf)
     assert info["qrl/cf_pairs"] == 6.0                     # 3 positives x 2 directions
     assert info["qrl/cf_examples"] == 1.0
     # anchor at the origin, positives at 1..3: forward all 0, backward 1..3
@@ -360,7 +632,9 @@ def test_cf_star_pairs_are_anchor_to_member_only_not_the_pairwise_grid(batch, qr
 def test_empty_cf_path_is_an_exact_zero_with_the_full_key_set(batch, qrl):
     psi = ladder_psi(batch)
     goals = goals_for(batch)
-    lag = LagrangeMultipliers(qrl.init_lagrange)
+    lag = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    )
     out = qrl_loss(psi, batch, goals, DirectedDistance(), qrl, lag, cf=None)
     assert float(out.terms["cf"]) == 0.0
     assert float(out.terms["neg_push"]) == 0.0
@@ -438,7 +712,7 @@ def test_cf_negatives_enter_the_push_as_sources_only(batch, qrl):
     dist = DirectedDistance()
 
     cf = make_cf(batch, [0, 0], [0, 2], [0.5, 3.0])     # one anchor, one negative
-    _, neg_push, info = cf_terms(psi, batch, psi_goal, goal_q, dist, qrl, cf)
+    _, neg_push, _, info = cf_terms(psi, batch, psi_goal, goal_q, dist, qrl, cf)
 
     psi_neg = cf[0][1:2]
     mask = goal_q == batch.traj_qid[batch.state_traj[0]]
@@ -459,9 +733,205 @@ def test_cf_negatives_are_scored_against_same_question_goals_only(batch, qrl):
     psi_goal = psi.index_select(0, goals.goal_state)
     goal_q = batch.traj_qid[goals.goal_traj]
     cf = make_cf(batch, [0], [2], [1.0])                # a q1 negative
-    _, _, info = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, cf)
+    _, _, _, info = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, cf)
     assert info["qrl/neg_push_pairs"] == float(int((goal_q == 0).sum()))
     assert info["qrl/neg_push_pairs"] < goals.n_goals    # q2's columns were excluded
+
+
+def test_pos_neg_push_pairs_the_class_against_the_negatives_both_ways(batch, qrl):
+    """The negation of the CF constraint. `epsilon_cf` says a meaning-PRESERVING rewrite of
+    step i is the same point as the original; nothing said a meaning-BREAKING rewrite of that
+    step is a different one. `neg_push` does not say it either -- it is a claim about reaching
+    the ANSWER, and a metric can hold d(neg, goal) large while still stacking the broken
+    rewrite on top of the correct one.
+
+    Class members are the anchor AND its positives, and both directions are measured, so one
+    example with an anchor, one positive and one negative gives 2 * 2 = 4 pairs.
+    """
+    torch.manual_seed(11)
+    psi = torch.randn(batch.n_states, D, requires_grad=True)
+    goals = goals_for(batch)
+    psi_goal = psi.index_select(0, goals.goal_state)
+    goal_q = batch.traj_qid[goals.goal_traj]
+
+    cf = make_cf(batch, [0, 0, 0], [0, 1, 2], [0.5, 0.7, 4.0])
+    _, _, pos_neg, info = cf_terms(
+        psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, cf
+    )
+    assert info["qrl/pos_neg_push_pairs"] == 4.0
+
+    # d(x, y) = relu(x - y) on the first coordinate. correct -> broken is 0 both times
+    # (the negative sits above), broken -> correct is 3.5 and 3.3.
+    fwd = torch.tensor([0.0, 0.0])
+    bwd = torch.tensor([4.0 - 0.5, 4.0 - 0.7])
+    assert info["qrl/pos_neg_push_dist_fwd_mean"] == pytest.approx(float(fwd.mean()))
+    assert info["qrl/pos_neg_push_dist_bwd_mean"] == pytest.approx(float(bwd.mean()), rel=1e-6)
+    assert info["qrl/pos_neg_push_dist_mean"] == pytest.approx(
+        float(torch.cat([fwd, bwd]).mean()), rel=1e-6
+    )
+    assert float(pos_neg) == pytest.approx(
+        float(torch.nn.functional.softplus(
+            qrl.softplus_offset - torch.cat([fwd, bwd]), beta=qrl.softplus_beta).mean()),
+        rel=1e-6,
+    )
+
+
+def test_pos_neg_push_is_asymmetric_and_keeps_both_directions_separate(batch, qrl):
+    """`d` is a QUASImetric and this term does not average the asymmetry away before it logs
+    it: `fwd` and `bwd` are reported apart so a metric that separates a broken step in one
+    direction only is visible as exactly that."""
+    torch.manual_seed(12)
+    psi = torch.randn(batch.n_states, D, requires_grad=True)
+    goals = goals_for(batch)
+    psi_goal = psi.index_select(0, goals.goal_state)
+    goal_q = batch.traj_qid[goals.goal_traj]
+
+    cf = make_cf(batch, [0, 0], [0, 2], [0.5, 4.0])
+    _, _, _, info = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, cf)
+    assert info["qrl/pos_neg_push_dist_fwd_mean"] == pytest.approx(0.0)
+    assert info["qrl/pos_neg_push_dist_bwd_mean"] == pytest.approx(3.5, rel=1e-6)
+    assert info["qrl/pos_neg_push_dist_fwd_mean"] != pytest.approx(
+        info["qrl/pos_neg_push_dist_bwd_mean"]
+    )
+
+
+def test_pos_neg_push_pairs_within_one_example_only(batch, qrl):
+    """Across examples these are rewrites of DIFFERENT steps, so their distance asserts
+    nothing and pairing them would quietly make this a second global push with a CF-shaped
+    sampler. Two examples, one class member and one negative each: 4 pairs, not 8."""
+    torch.manual_seed(13)
+    psi = torch.randn(batch.n_states, D, requires_grad=True)
+    goals = goals_for(batch)
+    psi_goal = psi.index_select(0, goals.goal_state)
+    goal_q = batch.traj_qid[goals.goal_traj]
+
+    # make_cf groups by departure state, so states 0 and 5 are two separate examples
+    cf = make_cf(batch, [0, 0, 5, 5], [0, 2, 0, 2], [0.5, 4.0, 1.0, 6.0])
+    _, _, _, info = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, cf)
+    assert info["qrl/pos_neg_push_pairs"] == 4.0        # 2 * (1 x 1 x 2 directions)
+    # the cross pairs would have been (0.5, 6.0) and (1.0, 4.0); their absence is what the
+    # count above proves, and the means confirm it -- only the within-example gaps appear
+    assert info["qrl/pos_neg_push_dist_bwd_mean"] == pytest.approx(
+        float(torch.tensor([4.0 - 0.5, 6.0 - 1.0]).mean()), rel=1e-6
+    )
+
+
+def test_pos_neg_push_keeps_positives_whose_anchor_went_missing(batch, qrl):
+    """`cf_anchor_missing` disqualifies a variant from being MEASURED against a hub, not from
+    being a correct wording of the step. The constraint drops it; this push must not, or a
+    class that lost its anchor would also stop separating its own negative."""
+    torch.manual_seed(14)
+    psi = torch.randn(batch.n_states, D, requires_grad=True)
+    goals = goals_for(batch)
+    psi_goal = psi.index_select(0, goals.goal_state)
+    goal_q = batch.traj_qid[goals.goal_traj]
+
+    cf = make_cf(batch, [0, 0], [1, 2], [0.7, 4.0])        # a positive and a negative, NO anchor
+    viol, _, pos_neg, info = cf_terms(
+        psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, cf
+    )
+    assert info["qrl/cf_anchor_missing"] == 1.0
+    assert info["qrl/cf_active"] == 0.0 and float(viol) == 0.0   # the constraint stood down
+    assert info["qrl/pos_neg_push_pairs"] == 2.0                 # the push did not
+    assert float(pos_neg) > 0.0
+
+
+def test_pos_neg_push_is_an_exact_zero_when_a_batch_has_no_negatives(batch, qrl):
+    """Keys never disappear (`losses/counterfactual.py::_empty_info`): a batch with an active
+    class and no negative logs 0.0 across the `pos_neg_push` family rather than dropping it,
+    so the curve is plottable on every batch."""
+    torch.manual_seed(15)
+    psi = torch.randn(batch.n_states, D, requires_grad=True)
+    goals = goals_for(batch)
+    psi_goal = psi.index_select(0, goals.goal_state)
+    goal_q = batch.traj_qid[goals.goal_traj]
+
+    cf = make_cf(batch, [0, 0], [0, 1], [0.5, 0.7])
+    _, _, pos_neg, info = cf_terms(psi, batch, psi_goal, goal_q, DirectedDistance(), qrl, cf)
+    assert info["qrl/cf_active"] == 1.0
+    assert float(pos_neg) == 0.0
+    assert all(info[k] == 0.0 for k in _CF_KEYS if k.startswith("qrl/pos_neg_push"))
+
+
+def test_pos_neg_push_gap_is_measured_against_the_cf_class_not_the_push_mean(batch, qrl):
+    """`pos_neg_push_dist_mean - cf_dist_mean`. Both sides are pairs of rewrites of the SAME
+    step, so the difference isolates "broken" from "reworded" with the step held fixed --
+    which the global push mean, taken over unrelated questions, cannot do."""
+    torch.manual_seed(16)
+    psi = torch.randn(batch.n_states, D, requires_grad=True)
+    goals = goals_for(batch)
+    lag = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    )
+
+    cf = make_cf(batch, [0, 0, 0], [0, 1, 2], [0.5, 0.7, 4.0])
+    out = qrl_loss(psi, batch, goals, DirectedDistance(), qrl, lag, cf=cf)
+    assert out.info["qrl/pos_neg_push_gap"] == pytest.approx(
+        out.info["qrl/pos_neg_push_dist_mean"] - out.info["qrl/cf_dist_mean"], rel=1e-6
+    )
+    assert out.info["qrl/pos_neg_push_gap"] > 0.0       # broken is further than reworded
+
+
+def test_pos_neg_push_gap_is_zero_when_the_class_was_never_measured(batch, qrl):
+    """0.0 must read as "not measured" on BOTH sides of the subtraction. A batch whose
+    positives all lost their anchor has negatives to push and no `cf_dist_mean` to push them
+    against, and reporting `pos_neg_push_dist_mean - 0.0` there would put a real number on a
+    plot that means nothing."""
+    torch.manual_seed(17)
+    psi = torch.randn(batch.n_states, D, requires_grad=True)
+    goals = goals_for(batch)
+    lag = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    )
+
+    cf = make_cf(batch, [0, 0], [1, 2], [0.7, 4.0])     # no anchor -> class never measured
+    out = qrl_loss(psi, batch, goals, DirectedDistance(), qrl, lag, cf=cf)
+    assert out.info["qrl/cf_active"] == 0.0
+    assert out.info["qrl/pos_neg_push_pairs"] > 0.0
+    assert out.info["qrl/pos_neg_push_gap"] == 0.0
+
+
+def test_pos_neg_push_reaches_the_variant_gradients(batch, qrl):
+    """The term is only worth having if it trains `psi` through the CF forward. Both the
+    negative's row and a class member's row must receive gradient, since both directions of
+    every pair are in the mean."""
+    torch.manual_seed(18)
+    psi = torch.randn(batch.n_states, D, requires_grad=True)
+    goals = goals_for(batch)
+    lag = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    )
+
+    cf = make_cf(batch, [0, 0, 0], [0, 1, 2], [0.5, 0.7, 4.0])
+    out = qrl_loss(psi, batch, goals, DirectedDistance(), qrl, lag, cf=cf)
+    out.total.backward()
+    grad = cf[0].grad
+    assert grad is not None and torch.isfinite(grad).all()
+    assert float(grad[2].abs().sum()) > 0.0      # the negative
+    assert float(grad[0].abs().sum()) > 0.0      # the anchor
+
+
+def test_cf_pos_neg_push_weight_zero_is_an_exact_zero_and_still_logs(batch, qrl):
+    """The ablation, same shape as `cf_neg_push_weight`'s: the term leaves the total and its
+    diagnostics stay in `metrics.jsonl`, so the run that turned it off is still comparable to
+    the run that did not."""
+    psi = ladder_psi(batch)
+    goals = goals_for(batch)
+    lag = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    )
+    cf = make_cf(batch, [0, 0, 0], [0, 1, 2], [0.5, 0.7, 4.0])
+    on = qrl_loss(psi, batch, goals, DirectedDistance(), qrl, lag, cf=cf)
+    off = qrl_loss(psi, batch, goals, DirectedDistance(),
+                   QRLConfig(cf_pos_neg_push_weight=0.0), lag, cf=cf)
+    assert off.info["qrl/pos_neg_push_dist_mean"] == pytest.approx(
+        on.info["qrl/pos_neg_push_dist_mean"]
+    )                                                     # still measured and logged
+    assert float(off.terms["pos_neg_push"]) > 0.0
+    assert float(off.total) == pytest.approx(
+        float(on.total) - float(on.terms["pos_neg_push"]), rel=1e-6
+    )
+
 
 
 def test_push_splits_partition_every_pair(batch):
@@ -483,19 +953,23 @@ def test_expected_init_values_against_the_actual_terms(random_reps, small_batch,
     terms satisfy their Jensen lower bound. Same checks `train.py` asserts at launch."""
     psi, _ = random_reps
     goals = goals_for(small_batch)
-    lag = LagrangeMultipliers(qrl.init_lagrange)
+    lag = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    )
     cf = make_cf(small_batch, [0, 0, 0], [0, 1, 2], [0.3, 0.4, 2.0], dim=psi.shape[-1])
     out = qrl_loss(psi, small_batch, goals, Distance("full_mrn", 8), qrl, lag, cf=cf)
 
     expected = expected_init_values(qrl, lag, out.info)
-    for name in ("local", "cf"):
+    for name in ("local", "path", "cf"):
         assert float(out.terms[name]) == pytest.approx(expected[name], abs=1e-6)
-    for name in ("push", "neg_push"):
+    for name in ("push", "neg_push", "pos_neg_push"):
         assert float(out.terms[name]) >= expected[name] - 1e-6      # softplus is convex
     assert float(out.total) == pytest.approx(
         float(out.terms["push"])
         + qrl.cf_neg_push_weight * float(out.terms["neg_push"])
+        + qrl.cf_pos_neg_push_weight * float(out.terms["pos_neg_push"])
         + float(out.terms["local"])
+        + float(out.terms["path"])
         + float(out.terms["cf"]),
         rel=1e-6,
     )
@@ -506,19 +980,24 @@ def test_expected_init_push_is_the_softplus_of_the_measured_mean(qrl):
     """Nothing in the helper is a constant: `push` is `softplus_beta(offset - push_dist_mean)`
     evaluated on the mean THIS batch measured (§18 -- an ASSUMED init value is how two
     regressions got through)."""
-    lag = LagrangeMultipliers(qrl.init_lagrange)
+    lag = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    )
     info = {k: 0.0 for k in _CF_KEYS}
     info.update({
         "qrl/push_dist_mean": 3.5,
-        "qrl/local_violation": 0.25,
+        "qrl/local_violation": 1.75,
+        "qrl/path_violation": 0.25,
         "qrl/cf_violation": -0.01,
     })
     out = expected_init_values(qrl, lag, info)
     beta, offset = qrl.softplus_beta, qrl.softplus_offset
     assert out["push"] == pytest.approx(math.log1p(math.exp(beta * (offset - 3.5))) / beta)
-    assert out["local"] == pytest.approx(float(lag.local.value) * 0.25)
+    assert out["local"] == pytest.approx(float(lag.local.value) * 1.75)
+    assert out["path"] == pytest.approx(float(lag.path.value) * 0.25)
     assert out["cf"] == pytest.approx(float(lag.cf.value) * -0.01)
     assert out["neg_push"] == 0.0            # no negative pairs this batch
+    assert out["pos_neg_push"] == 0.0        # nor any (class member, negative) pairs
 
 
 # =======================================================================================
@@ -536,11 +1015,16 @@ def test_there_is_no_dyn_term_and_no_phi_in_the_loss(batch, qrl):
 
     psi = ladder_psi(batch)
     goals = goals_for(batch)
-    lag = LagrangeMultipliers(qrl.init_lagrange)
+    lag = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    )
     out = qrl_loss(psi, batch, goals, DirectedDistance(), qrl, lag)
-    assert set(out.terms) == {"push", "neg_push", "local", "cf"}
+    assert set(out.terms) == {"push", "neg_push", "pos_neg_push", "local", "path", "cf"}
     assert float(out.total) == pytest.approx(
-        float(out.terms["push"]) + float(out.terms["local"]), rel=1e-6
+        float(out.terms["push"])
+        + float(out.terms["local"])
+        + float(out.terms["path"]),
+        rel=1e-6,
     )
     assert not any(k.startswith("qrl/dyn") for k in out.info)
     assert "phi" not in inspect.signature(qrl_loss).parameters
@@ -552,7 +1036,9 @@ def test_there_is_no_dyn_term_and_no_phi_in_the_loss(batch, qrl):
 def test_cf_neg_push_weight_zero_is_an_exact_zero_and_still_logs(batch, qrl):
     psi = ladder_psi(batch)
     goals = goals_for(batch)
-    lag = LagrangeMultipliers(qrl.init_lagrange)
+    lag = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    )
     cf = make_cf(batch, [0, 0], [0, 2], [0.5, 3.0])
     on = qrl_loss(psi, batch, goals, DirectedDistance(), qrl, lag, cf=cf)
     off = qrl_loss(psi, batch, goals, DirectedDistance(),
@@ -606,7 +1092,9 @@ def test_integration_one_step_on_the_real_distance(small_batch, random_reps, qrl
     stay finite, and put a gradient on psi, the CF variants and both multipliers."""
     psi, _ = random_reps
     goals = goals_for(small_batch)
-    lag = LagrangeMultipliers(qrl.init_lagrange)
+    lag = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    )
     dist = Distance(variant, components=8)
     cf = make_cf(
         small_batch, [0, 0, 0, 5], [0, 1, 2, 0], [0.1, 0.2, 1.5, 0.3], dim=psi.shape[-1]
@@ -622,7 +1110,7 @@ def test_integration_one_step_on_the_real_distance(small_batch, random_reps, qrl
     out.total.backward()
     for tensor, name in ((psi, "psi"), (psi_v, "cf psi")):
         assert tensor.grad is not None and torch.isfinite(tensor.grad).all(), name
-    for m, name in ((lag.local, "lambda_local"), (lag.cf, "lambda_cf")):
+    for m, name in ((lag.path, "lambda_path"), (lag.cf, "lambda_cf")):
         assert m.raw.grad is not None and float(m.raw.grad) != 0.0, name
     if variant == "iqe":
         assert dist.alpha_raw.grad is not None      # the learned alpha trains
@@ -653,7 +1141,9 @@ def test_the_dual_optimizer_steps_once_per_grad_accum_boundary(batch, qrl):
     schedules and the constraint curve would not mean what it says.
     """
     grad_accum = 2
-    lag = LagrangeMultipliers(qrl.init_lagrange)
+    lag = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    )
     dual = torch.optim.AdamW(lag.parameters(), lr=qrl.lagrange_lr, betas=(0.9, 0.999),
                              weight_decay=0.0)
     psi = ladder_psi(batch, gap=3.0)          # violating, so the multipliers have work to do
@@ -666,26 +1156,28 @@ def test_the_dual_optimizer_steps_once_per_grad_accum_boundary(batch, qrl):
         if (micro + 1) % grad_accum == 0:
             dual.step()
             dual.zero_grad(set_to_none=True)
-        seen.append(float(lag.local.value))
+        seen.append(float(lag.path.value))
     # `seen[i]` is read AFTER micro-batch i, so the two boundaries fall at i = 1 and i = 3:
     # the value is unchanged across (0 -> 1 is the first step) and holds between steps.
     assert seen[0] != seen[1]                 # boundary at micro 1
     assert seen[1] == seen[2]                 # micro 2 accumulates, does not step
     assert seen[2] != seen[3]                 # boundary at micro 3
-    assert seen[3] > seen[1] > seen[0]        # violating => lambda_local rises, monotonically
+    assert seen[3] > seen[1] > seen[0]        # violating => lambda_path rises, monotonically
 
 
 def test_the_accumulated_dual_gradient_is_the_sum_of_the_micro_batches(batch, qrl):
-    lag = LagrangeMultipliers(qrl.init_lagrange)
+    lag = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    )
     psi = ladder_psi(batch, gap=3.0)
     goals = goals_for(batch)
 
     one = qrl_loss(psi, batch, goals, DirectedDistance(), qrl, lag)
     (one.total / 2).backward()
-    single = float(lag.local.raw.grad)
+    single = float(lag.path.raw.grad)
     two = qrl_loss(psi, batch, goals, DirectedDistance(), qrl, lag)
     (two.total / 2).backward()
-    assert float(lag.local.raw.grad) == pytest.approx(2 * single, rel=1e-6)
+    assert float(lag.path.raw.grad) == pytest.approx(2 * single, rel=1e-6)
 
 
 def test_the_multipliers_are_not_model_parameters(cfg):
@@ -697,7 +1189,8 @@ def test_the_multipliers_are_not_model_parameters(cfg):
     import qrl_prm.train as qtrain
 
     src = (REPO_ROOT / "qrl_prm" / "train.py").read_text()
-    assert "LagrangeMultipliers(qrl.init_lagrange).to(device)" in src
+    assert "lagrange = LagrangeMultipliers(" in src
+    assert ").to(device)" in src
     assert "dual_optimizer = torch.optim.AdamW(" in src
     assert "lagrange.parameters()" in src
     # the dual optimiser is built from the multipliers ALONE, never from model.parameters()
@@ -728,14 +1221,16 @@ def test_the_checkpoint_carries_the_multipliers_and_the_knobs(tmp_path, cfg, qrl
     model = nn.Module()
     model.psi = nn.Linear(4, 4)
     model.distance = Distance("iqe", components=8)
-    lag = LagrangeMultipliers(qrl.init_lagrange)
+    lag = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    )
     with torch.no_grad():
-        lag.local.raw.add_(1.25)
+        lag.path.raw.add_(1.25)
 
     path = save_qrl_checkpoint(tmp_path / "step10", model, cfg, qrl, lag, step=10)
     payload = torch.load(path / "heads.pt", map_location="cpu", weights_only=False)
     assert payload["step"] == 10
-    assert payload["qrl_lagrange"]["local"] == pytest.approx(float(lag.local.raw), rel=1e-6)
+    assert payload["qrl_lagrange"]["path"] == pytest.approx(float(lag.path.raw), rel=1e-6)
     assert payload["qrl_lagrange"]["cf"] == pytest.approx(float(lag.cf.raw), rel=1e-6)
     # phi is frozen and untrained under qrl_prm/, and the payload says so rather than leaving
     # a random head sitting byte-for-byte where a trained one lives
@@ -799,28 +1294,40 @@ def test_check_init_values_passes_on_a_real_micro_batch(small_batch, random_reps
 
     psi, _ = random_reps
     goals = goals_for(small_batch)
-    lag = LagrangeMultipliers(qrl.init_lagrange)
+    lag = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    )
     out = qrl_loss(psi, small_batch, goals, Distance("iqe", 8), qrl, lag)
     check_init_values(qrl, out.terms, out.info, expected_init_values(qrl, lag, out.info))
 
 
 def test_check_init_values_catches_a_multiplier_that_skipped_softplus_inv(qrl):
-    """The failure the equality check exists for: storing `init_lagrange` RAW starts the
-    multiplier at softplus(0.01) = 0.698, 70x its intended value. Nothing downstream would
-    say so -- the constraint would simply be weighted 70x too hard from step one."""
+    """The failure the equality check exists for: storing an `init_lagrange_*` value RAW
+    instead of `softplus_inv` of it. How big the error is depends on where the multiplier
+    starts -- at QRL's own 0.01 it is softplus(0.01) = 0.698, 70x high; at the path
+    multiplier's 3.0 it is softplus(3.0) = 3.049, a subtler 1.6% -- and neither announces itself
+    downstream, the constraint simply carries the wrong weight from step one. The equality
+    check catches both because INIT_TOLERANCE is 1e-4, not a percentage."""
     from qrl_prm.train import check_init_values
 
-    good = LagrangeMultipliers(qrl.init_lagrange)
+    good = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    )
     terms = {"push": torch.tensor(25.0), "neg_push": torch.tensor(0.0),
-             "local": good.local.value.detach() * 0.5, "cf": torch.tensor(0.0)}
+             "pos_neg_push": torch.tensor(0.0),
+             "local": good.local.value.detach() * 2.0,
+             "path": good.path.value.detach() * 0.5, "cf": torch.tensor(0.0)}
     info = {k: 0.0 for k in _CF_KEYS}
-    info.update({"qrl/push_dist_mean": 30.0, "qrl/local_violation": 0.5,
+    info.update({"qrl/push_dist_mean": 30.0, "qrl/local_violation": 2.0,
+                 "qrl/path_violation": 0.5,
                  "qrl/cf_violation": 0.0, "qrl/push_saturated_frac": 0.1})
     check_init_values(qrl, terms, info, expected_init_values(qrl, good, info))
 
-    bad = LagrangeMultipliers(qrl.init_lagrange)
+    bad = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    )
     with torch.no_grad():
-        bad.local.raw.fill_(qrl.init_lagrange)          # raw, not softplus_inv(raw)
+        bad.path.raw.fill_(qrl.init_lagrange_path)      # raw, not softplus_inv(raw)
     with pytest.raises(AssertionError, match="softplus_inv"):
         check_init_values(qrl, terms, info, expected_init_values(qrl, bad, info))
 
@@ -831,9 +1338,12 @@ def test_check_init_values_catches_a_saturated_push(qrl):
     three."""
     from qrl_prm.train import check_init_values
 
-    lag = LagrangeMultipliers(qrl.init_lagrange)
+    lag = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    )
     info = {k: 0.0 for k in _CF_KEYS}
     info.update({"qrl/push_dist_mean": 400.0, "qrl/local_violation": 0.0,
+                 "qrl/path_violation": 0.0,
                  "qrl/cf_violation": 0.0, "qrl/push_saturated_frac": 1.0})
     expected = expected_init_values(qrl, lag, info)
     terms = {k: torch.tensor(float(v)) for k, v in expected.items() if k != "total"}
@@ -914,7 +1424,9 @@ def test_run_micro_batch_end_to_end_on_a_stub_model(cfg, qrl):
     ]
     torch.manual_seed(6)
     model = StubModel(cfg.heads.latent_dim, cfg.distance.variant)
-    lag = LagrangeMultipliers(qrl.init_lagrange)
+    lag = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    )
     device = torch.device("cpu")
 
     batch, goals, reps, out = run_micro_batch(
@@ -931,7 +1443,7 @@ def test_run_micro_batch_end_to_end_on_a_stub_model(cfg, qrl):
     check_init_values(qrl, out.terms, out.info, expected_init_values(qrl, lag, out.info))
     (out.total / cfg.train.grad_accum).backward()
     assert any(p.grad is not None for p in model.parameters())
-    assert lag.local.raw.grad is not None and lag.cf.raw.grad is not None
+    assert lag.path.raw.grad is not None and lag.cf.raw.grad is not None
 
     metrics = comparability_probes(reps, batch, goals, model, cfg)
     assert "probe14/delta_boundary/mean" in metrics
@@ -950,7 +1462,9 @@ def test_the_cf_key_set_is_logged_even_when_nothing_attaches(cfg, qrl):
     rows = [synthetic_row("q1", [T, T, T]), synthetic_row("q1", [T, T, F, F])]
     torch.manual_seed(7)
     model = StubModel(cfg.heads.latent_dim, cfg.distance.variant)
-    lag = LagrangeMultipliers(qrl.init_lagrange)
+    lag = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    )
     for ctx in (None, NothingAttaches()):
         _, _, _, out = run_micro_batch(
             model, rows, [0, 1], cfg, qrl, lag, torch.device("cpu"),
@@ -1071,7 +1585,9 @@ def test_real_cf_examples_encode_and_flow_through_the_qrl_loss(cf_examples, cfg,
     psi = torch.randn(batch.n_states, latent, requires_grad=True)
     psi_v = torch.randn(enc.n_variants, latent, requires_grad=True)
     goals = goals_for(batch)
-    lag = LagrangeMultipliers(qrl.init_lagrange)
+    lag = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    )
     cf = (psi_v, enc.variant_state, enc.variant_example, enc.variant_kind)
 
     out = qrl_loss(psi, batch, goals, Distance("iqe", 8), qrl, lag, cf=cf)

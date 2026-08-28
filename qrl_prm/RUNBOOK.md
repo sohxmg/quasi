@@ -95,8 +95,8 @@ jq -c 'select(.event|startswith("launch/"))' runs/qrl_iqe_probe/events.jsonl
 | `launch/data` | `optimizer_steps: 1464`, `warmup_steps: 44`, `questions: 34640`, `sequences_total: 149351`. **If it prints ~106, stop** — the `n_questions`/`grad_accum` regression (§11.1) |
 | `launch/config` | `qrl/*` knobs are the shipped defaults; `distance/variant: iqe`; `note_head` names the deliberate divergence |
 | `launch/cf_data` | `examples: ~41380`, `rows_with_prefix_hash == rows` (a mismatch aborts by design), `cap_binds: true`, `examples_dropped_question_absent` a handful. A **leaked val question is fatal at any count** and stops the launch |
-| `launch/model` | `trainable_tensors` = `{lora: 392, psi: 14, phi: 0, action_pool: 0, distance: 1, …}` — **`distance: 1` is IQE's learned alpha and must be there**, and **`phi: 0` is required, not a regression**: φ is frozen under `qrl_prm/` because the arrived state is read rather than predicted, and `assert_qrl_phase1_trainable` refuses to start if it is trainable (read `note_phi` in the same event). `lagrange_params: 2`; `trainable_params: 20042753` — the baselines' 22,407,168 MINUS φ's 2,364,416, PLUS α. Do not compare this number to §4's baselines, which trained φ |
-| `launch/init_values` | asserted, so it either passes or the run stops. Eyeball `push_saturated_frac` (must be well under 1.0) and `local_dist_mean` (starts far above 1.0 — correct) |
+| `launch/model` | `trainable_tensors` = `{lora: 392, psi: 14, phi: 0, action_pool: 0, distance: 1, …}` — **`distance: 1` is IQE's learned alpha and must be there**, and **`phi: 0` is required, not a regression**: φ is frozen under `qrl_prm/` because the arrived state is read rather than predicted, and `assert_qrl_phase1_trainable` refuses to start if it is trainable (read `note_phi` in the same event). `lagrange_params: 3` (local, path, cf); `trainable_params: 20042753` — the baselines' 22,407,168 MINUS φ's 2,364,416, PLUS α. Do not compare this number to §4's baselines, which trained φ |
+| `launch/init_values` | asserted, so it either passes or the run stops. Eyeball `push_saturated_frac` (must be well under 1.0), `local_dist_mean` (starts far above 1.0 — correct), `local_transitions` (must equal the transition count) and `path_violation` (near **zero** at init — the k ≥ 2 rows are mostly slack on an untrained ψ, and that asymmetry is why the two constraints are split) |
 | `launch/memory_probe` | **`peak_vram_gb_with_probes` under ~15 GB.** That is the real high-water mark; `peak_vram_gb` is the training step alone |
 
 **The matched-data proof, and it is free:**
@@ -155,21 +155,26 @@ Detach `Ctrl-b d`, reattach `tmux attach -t qrl`. Checkpoints land in
 
 ```bash
 python scripts/plot_metrics.py runs/qrl_iqe/metrics.jsonl --keys \
-  qrl/local_dist_mean qrl/local_violation qrl/lagrange_local \
+  qrl/local_dist_mean qrl/local_over_cost_frac qrl/local_violation qrl/lagrange_local \
+  qrl/path_ratio_mean qrl/path_violation qrl/path_gap_mean qrl/lagrange_path \
   qrl/cf_sq_dev qrl/cf_violation qrl/cf_p95 qrl/lagrange_cf qrl/cf_active \
-  qrl/push_dist_mean qrl/push_saturated_frac qrl/neg_push_gap \
-  loss/total loss/push loss/local loss/cf \
+  qrl/push_dist_mean qrl/push_saturated_frac qrl/neg_push_gap qrl/pos_neg_push_gap \
+  loss/total loss/push loss/path loss/cf loss/pos_neg_push \
   probe14/delta_good_of_correct/frac_above_natural probe03/gap
 ```
 
 | curve | reading |
 |---|---|
-| **`qrl/local_dist_mean` → 1.0** | **THE RULER.** The direct answer to IMPLEMENTATION.md §9's decaying `backup/delta_mean`. If it does not come down toward `step_cost` by ~step 300, the objective is not doing its job |
-| `qrl/lagrange_local`, `qrl/lagrange_cf` | must **rise then stabilise**. Monotone climbing for the whole run while the matching violation does not fall = the constraint cannot be satisfied. For λ_cf that is the CF corpus contradicting itself |
-| `qrl/local_violation`, `qrl/cf_violation` | the **sign** is what matters: negative = satisfied |
+| **`qrl/local_dist_mean` → 1.0** | **THE RULER** — a mean over the transitions **alone**. The direct answer to IMPLEMENTATION.md §9's decaying `backup/delta_mean`. If it does not come down toward `step_cost` by ~step 300, the objective is not doing its job. If it drifts **up**, `λ_local` is losing → raise `init_lagrange_local`, not `lagrange_lr`. Pooled with the k ≥ 2 rows this went 2.263 → **3.009** over 20 steps where the same λ on k = 1 alone took it 2.263 → **1.390** |
+| `qrl/local_over_cost_frac` | reaching **1.000** means every adjacent pair is over budget — the clearest early sign λ_local is under-powered |
+| **`qrl/path_ratio_mean` → 1.0** | cost per observed step at `k ≥ 2`, same units as the ruler so they plot together. The ruler near 1.0 with this far above it is exactly the failure the k ≥ 2 rows exist to catch: adjacent steps satisfied, observed sub-paths blowing out anyway. `loj243n4` read **5.6** here |
+| `qrl/path_gap_mean`, `qrl/path_gap_max` | whether the `path_max_gap: 3` cap is binding, and whether long gaps dominate the mean |
+| `qrl/lagrange_local`, `qrl/lagrange_path`, `qrl/lagrange_cf` | must **rise then stabilise**, or settle downward from their inits. Monotone climbing for the whole run while the matching violation does not fall = the constraint cannot be satisfied. For λ_cf that is the CF corpus contradicting itself |
+| `qrl/local_violation`, `qrl/path_violation`, `qrl/cf_violation` | the **sign** is what matters: negative = satisfied |
 | `qrl/cf_p95` | the tail, not the mean. Fat tail = paraphrases that could still flip a verdict |
 | `qrl/push_saturated_frac` | rising to 1.0 = the push term has no gradient left; the offset is too small |
 | `qrl/neg_push_gap` | should **open** (CF negatives getting further from goals than the average pair) |
+| **`qrl/pos_neg_push_gap`** | should **open**. `pos_neg_push_dist_mean − cf_dist_mean`: how much further a **broken** rewrite of a step sits than a **reworded** one. Both sides are rewrites of the same step, so this is the one number that isolates the property from the scale. Flat = the metric is separating scale, not meaning |
 | `probe14/delta_good_of_correct/frac_above_natural` | the cross-method comparable — same function every baseline logged |
 
 > **Before reading a climbing `qrl/lagrange_cf` as bad CF data, check `qrl/cf_positives` and
@@ -205,8 +210,8 @@ python scripts/plot_metrics.py runs/qrl_iqe/metrics.jsonl --keys \
 Quick tail without the summariser:
 
 ```bash
-tail -1 runs/qrl_iqe/metrics.jsonl | jq '{step, "qrl/local_dist_mean", "qrl/lagrange_local", "qrl/lagrange_cf", "qrl/cf_sq_dev", "qrl/push_saturated_frac"}'
-watch -n 300 'tail -1 runs/qrl_iqe/metrics.jsonl | jq "{step, \"qrl/local_dist_mean\", \"qrl/lagrange_cf\"}"'
+tail -1 runs/qrl_iqe/metrics.jsonl | jq '{step, "qrl/local_dist_mean", "qrl/local_over_cost_frac", "qrl/path_ratio_mean", "qrl/lagrange_local", "qrl/lagrange_path", "qrl/lagrange_cf", "qrl/cf_sq_dev", "qrl/push_saturated_frac", "qrl/pos_neg_push_gap"}'
+watch -n 300 'tail -1 runs/qrl_iqe/metrics.jsonl | jq "{step, \"qrl/local_dist_mean\", \"qrl/path_ratio_mean\", \"qrl/lagrange_local\", \"qrl/lagrange_cf\"}"'
 ```
 
 **Flat curves by step ~300 mean the rest of the run is wasted.** Kill it, do not wait.
@@ -282,6 +287,12 @@ bash qrl_prm/train.sh --set qrl.cf_encode_max_tokens=8192 --set run.name=qrl_che
 
 # is the CF-negative push doing anything?
 bash qrl_prm/train.sh --set qrl.cf_neg_push_weight=0 --set run.name=qrl_nonegpush
+
+# is separating broken rewrites from correct ones doing anything?
+bash qrl_prm/train.sh --set qrl.cf_pos_neg_push_weight=0 --set run.name=qrl_noposneg
+
+# the local-only constraint again -- gap 1 and nothing else, i.e. upstream's
+bash qrl_prm/train.sh --set qrl.path_max_gap=1 --set run.name=qrl_k1   # empty path set
 
 # the push offset, if push_saturated_frac ran high
 bash qrl_prm/train.sh --set qrl.softplus_offset=50 --set run.name=qrl_off50

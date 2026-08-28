@@ -1,7 +1,12 @@
-"""The QRL objective: one push term and two Lagrangian constraints.
+"""The QRL objective: three push terms and three Lagrangian constraints.
 
-    L  =  push  +  cf_neg_push_weight * neg_push
-          +  lambda_local * ( E[relu(d(psi_z, psi_{z+1}) - step_cost)^2]  - epsilon_local^2 )
+    L  =  push
+          +  cf_neg_push_weight     * neg_push
+          +  cf_pos_neg_push_weight * pos_neg_push
+          +  lambda_local * ( E_{j=i+1}[relu(d(s_i, s_j) - step_cost)^2]
+                              - epsilon_local^2 )
+          +  lambda_path  * ( E_{2 <= j-i <= path_max_gap}[relu(d(s_i, s_j) - (j-i)*step_cost)^2]
+                              - epsilon_path^2 )
           +  lambda_cf    * ( E[(relu(d(anchor, v))^2 + relu(d(v, anchor))^2)/2] - epsilon_cf^2 )
 
 **There is no latent-dynamics term and there is no `phi`.** QRL needs both because its
@@ -48,18 +53,61 @@ queried with at eval and the goal distribution every baseline run trained under.
 Read `qrl/push_saturated_frac` against `softplus_offset`: it is the fraction of pairs already
 past the offset, where the transform is flat and the term has no gradient left.
 
-## 2. The local constraint (`losses/local_constraint.py:48-63`)
+## 2. The two sub-path constraints -- k = 1 and k >= 2, under SEPARATE multipliers
 
-`E[relu(d(psi_z, psi_{z+1}) - step_cost)^2] <= epsilon_local^2` over every observed
-transition -- correct AND incorrect trajectories, because a transition is an observed step
-whatever the step's verdict, and the metric has to be able to measure both.
+Both say the same thing at different gaps: an observed sub-path of `k` steps costs at most
+`k * step_cost`. `local_violation` enforces it at `k = 1` and `path_violation` at
+`2 <= k <= path_max_gap`, over FORWARD same-trajectory pairs, correct AND incorrect
+trajectories, because a transition is an observed step whatever the step's verdict and the
+metric has to be able to measure both.
 
-**The order is mean-then-target**, exactly as QRL writes it: square the per-transition
-deviation, mean over transitions, THEN subtract `epsilon^2`. `mean(relu(d-c)^2) - eps^2` and
-`mean(relu(d-c)^2 - eps^2)` agree here only because the target is constant; keeping QRL's
-order means the violation is one scalar with a readable sign rather than a per-pair quantity.
+**k = 1 is upstream's local constraint, unchanged.** `losses/local_constraint.py:48-63` is
+`E[relu(d(s_i, s_{i+1}) - step_cost)^2]`, which is `local_violation` character for character.
 
-`qrl/local_dist_mean` is THE ruler. It should pin to ~`step_cost`.
+**Why k >= 2 is not redundant, even though the triangle inequality implies it.** For any
+`i < j` the observed trace is itself a path of `j - i` steps from `s_i` to `s_j`, so
+`d(s_i, s_j) <= (j - i) * step_cost` is a true statement about the ground-truth quasimetric
+whenever each step costs at most `step_cost` -- which is exactly what k = 1 asserts. In exact
+arithmetic the k >= 2 rows are therefore implied and add nothing. In practice they are
+load-bearing, because k = 1 is enforced SOFTLY, through a mean of squared deviations, and a
+mean averages a heavy tail away: run `loj243n4` held the adjacent-step mean at 1.418 with a
+max of 6.721 and 80% of transitions over cost, and same-trajectory pairs at a mean gap of
+2.010 measured 11.162 where 2.85 was implied. The k >= 2 rows are what measures that leak
+instead of hoping the bound propagates through it.
+
+**They are TWO constraints and not one, and the pair sets are DISJOINT.** They were merged
+into a single mean once, in run `0lcrduzl`, and the merge is what this split undoes. A mean
+divides by every pair; a ONE-SIDED constraint leaves most of the wide set at exactly zero.
+Measured at step 1 of `0lcrduzl` against `1wbpyf2g` on the identical seed-42 batch:
+
+    set        pairs   violating       sum(dev^2)   mean
+    k = 1        489   486  (99.4%)         969.4   1.982
+    k >= 2     3,119   418  (13.4%)         226.3   0.073
+    pooled     3,608   904  (25.1%)       1,195.7   0.331
+
+The k = 1 rows carried 81% of the violation and received 489/3608 = 13.5% of the weight, and
+`local_dist_mean` went 2.263 -> 3.009 over 20 steps where the same multiplier on the k = 1
+constraint alone had taken it 2.263 -> 1.390. Splitting the means is what fixes that. Because
+the sets are disjoint nothing is counted twice, which is what makes two multipliers legal --
+a `path` set that included k = 1 would be one constraint under two multipliers whose ratio
+nothing determines.
+
+**One-sided at every k.** `relu` means a sub-path the metric already measures as SHORTER than
+its observed length is free. That is not slack, it is correctness: the observed trace need not
+be the shortest path between its own endpoints, and penalising `d < k` would assert it is.
+
+**The order is mean-then-target**, exactly as QRL writes it: square the per-pair deviation,
+mean over pairs, THEN subtract `epsilon^2`. `mean(relu(d-t)^2) - eps^2` and
+`mean(relu(d-t)^2 - eps^2)` agree only because the target is constant per pair; keeping QRL's
+order means each violation is one scalar with a readable sign rather than a per-pair quantity.
+
+**FORWARD pairs only.** `d` is a QUASImetric. There is no observed path back up a reasoning
+trace, so `d(s_j, s_i)` for `j > i` SHOULD be large, and constraining it would assert the
+opposite. Both pair sets are strictly upper-triangular in step order.
+
+`qrl/local_dist_mean` is THE ruler and should pin to ~`step_cost`.
+`qrl/path_ratio_mean` is its k >= 2 counterpart: cost per observed step, averaged over every
+gap in that set, in the same units and directly comparable to it.
 
 ## 3. The CF constraint -- a star centred on the ANCHOR's own arrived state
 
@@ -91,11 +139,38 @@ so the terminal case is not special and there is nothing to count.
 
 **CF NEGATIVES ARE NEVER IN THE CONSTRAINT.** Two different wrong rewrites of a step have no
 reason to be the same point, and asserting it is a claim this data cannot support (the same
-rule `losses/counterfactual.py` states for its own negatives). They enter the PUSH term as
-sources -- `d(psi(prefix + neg), psi_g)` against same-question goal columns -- which is the
-eval-aligned direction: a broken state as the source of the query. That is the ONE thing
-`variant_state` is still read for: it names the host trajectory, hence the question whose
-goal columns a negative is scored against.
+rule `losses/counterfactual.py` states for its own negatives). They enter two PUSH terms
+instead.
+
+## 3a. `neg_push` -- broken states away from GOALS
+
+`d(psi(prefix + neg), psi_g)` against same-question goal columns, which is the eval-aligned
+direction: a broken state as the source of the query. That is the ONE thing `variant_state`
+is still read for -- it names the host trajectory, hence the question whose goal columns a
+negative is scored against.
+
+## 3b. `pos_neg_push` -- broken states away from the CLASS, in both directions
+
+`softplus(offset - d)` over both directions of every (class member, negative) pair inside one
+CF example, where the class members are the anchor and its positives.
+
+This is the direct negation of the CF constraint, and it closes the gap that constraint left
+open. §3 says a meaning-PRESERVING rewrite of step `i` is the same point as the original.
+Nothing said that a meaning-BREAKING rewrite of the same step is a DIFFERENT one. `neg_push`
+does not say it either: it is a claim about reaching the ANSWER, and a metric can hold
+`d(neg, goal)` large while still placing the broken rewrite on top of the correct one -- at
+which point a paraphrase-sized perturbation moves a step across the verdict boundary, which
+is failure (4) again from the other side.
+
+**Both directions**, exactly as the constraint binds both: you cannot reach a broken step from
+a correct one, and you cannot recover from a broken step back to the correct one.
+
+**Same example only.** A negative and a positive drawn from different CF examples are
+rewrites of DIFFERENT steps, so their distance is not a statement about anything, and pairing
+them would quietly turn this into a second global push with a CF-shaped sampler.
+
+`qrl/pos_neg_push_gap` is the number to read: `pos_neg_push_dist_mean - cf_dist_mean`, the
+separation between "same step, reworded" and "same step, broken". It should OPEN.
 
 ## 4. Empty paths
 
@@ -223,46 +298,159 @@ def push_masks(batch: Batch, goals: GoalIndex) -> dict[str, Tensor]:
 
 
 # ---------------------------------------------------------------------------------------
-# the local constraint
+# the two sub-path constraints: k = 1 (local) and 2 <= k <= path_max_gap (path)
 # ---------------------------------------------------------------------------------------
+
+_LOCAL_KEYS = (
+    "qrl/local_dist_mean",
+    "qrl/local_dist_max",
+    "qrl/local_sq_dev",
+    "qrl/local_violation",
+    "qrl/local_over_cost_frac",
+    "qrl/local_transitions",
+)
+
+_PATH_KEYS = (
+    "qrl/path_dist_mean",
+    "qrl/path_dist_max",
+    "qrl/path_ratio_mean",
+    "qrl/path_sq_dev",
+    "qrl/path_violation",
+    "qrl/path_over_cost_frac",
+    "qrl/path_pairs",
+    "qrl/path_gap_mean",
+    "qrl/path_gap_max",
+)
+
+
+def traj_pairs(
+    batch: Batch, min_gap: int, max_gap: int
+) -> tuple[Tensor, Tensor, Tensor]:
+    """`(src, dst, gap)` for the FORWARD same-trajectory pairs with `min_gap <= gap <= max_gap`.
+
+    `max_gap == 0` means unlimited, the reading `push_chunk_cols: 0` already has.
+
+    `gap == 1` is the set of observed transitions -- element for element the same pairs
+    `batch.row_src -> batch.row_dst` names, since `row_src` is the state index of `s_{i-1}`
+    and `row_dst` that of `s_i`. It is derived from the same `(S, S)` mask as the k >= 2 rows
+    rather than read off `row_src`/`row_dst` directly, so that `local_pairs` and `path_pairs`
+    are provably a PARTITION of one pair set: no pair can fall in both, and none can be lost
+    between them. `test_local_pairs_are_the_walked_transition_graph` is the cross-check that
+    the mask agrees with the edge list.
+
+    Strictly `state_step[dst] > state_step[src]`: `d` is a quasimetric and there is no
+    observed path back up a reasoning trace, so the reverse direction is not constrained.
+    """
+    same_traj = batch.state_traj[:, None] == batch.state_traj[None, :]        # (S, S)
+    gap = batch.state_step[None, :] - batch.state_step[:, None]               # (S, S), j - i
+    keep = same_traj & (gap >= min_gap)
+    if max_gap > 0:
+        keep = keep & (gap <= max_gap)
+    src, dst = keep.nonzero(as_tuple=True)
+    return src, dst, gap[src, dst]
+
+
+def local_pairs(batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
+    """The k = 1 slice: every observed transition. `qrl.path_max_gap` does NOT apply -- the
+    local constraint is upstream's and is never capped away."""
+    return traj_pairs(batch, min_gap=1, max_gap=1)
+
+
+def path_pairs(batch: Batch, qrl: QRLConfig) -> tuple[Tensor, Tensor, Tensor]:
+    """The k >= 2 rows, capped at `qrl.path_max_gap` (0 = unlimited).
+
+    `path_max_gap == 1` therefore returns an EMPTY set, which is the local-only ablation and
+    takes the same exact-zero path an empty batch takes.
+    """
+    return traj_pairs(batch, min_gap=2, max_gap=qrl.path_max_gap)
 
 
 def local_violation(
     psi: Tensor, batch: Batch, distance: Distance, qrl: QRLConfig
 ) -> tuple[Tensor, Tensor, dict[str, float]]:
-    """`(violation, d_step, info)`. `local_constraint.py:56-59`, transition-for-transition."""
-    if batch.n_rows == 0:
-        # EXACT ZERO, and the logged violation is 0.0 to match. A batch with no transitions is
-        # not evidence that the constraint is satisfied, so it must not push the multiplier
-        # either way; `-epsilon^2` here would make every empty batch a vote to lower
-        # lambda_local. `qrl/local_transitions = 0` is what distinguishes "no data" from
-        # "violation happens to be zero". Same rule as `_empty_cf_info`.
-        zero = psi.sum() * 0.0
-        return zero, psi.new_zeros(0), {
-            "qrl/local_dist_mean": 0.0,
-            "qrl/local_dist_max": 0.0,
-            "qrl/local_sq_dev": 0.0,
-            "qrl/local_violation": 0.0,
-            "qrl/local_over_cost_frac": 0.0,
-            "qrl/local_transitions": 0.0,
-        }
-    d_step = distance(psi.index_select(0, batch.row_src), psi.index_select(0, batch.row_dst))
-    sq_deviation = (d_step - qrl.step_cost).relu().square().mean()
+    """`(violation, d, info)`. `losses/local_constraint.py:48-63`, unchanged.
+
+    `E[relu(d(s_i, s_{i+1}) - step_cost)^2] - epsilon_local^2` over the observed transitions.
+    THE RULER: `qrl/local_dist_mean` -> `step_cost` is the curve the run is steered by.
+    """
+    if batch.n_states == 0:
+        # EXACT ZERO, and the logged violation is 0.0 to match. A batch with no pairs is not
+        # evidence that the constraint is satisfied, so it must not push the multiplier either
+        # way; `-epsilon^2` here would make every empty batch a vote to lower lambda_local.
+        # `qrl/local_transitions = 0` is what distinguishes "no data" from "violation happens
+        # to be zero". Same rule as `_empty_cf_info`.
+        return psi.sum() * 0.0, psi.new_zeros(0), {k: 0.0 for k in _LOCAL_KEYS}
+
+    src, dst, _ = local_pairs(batch)
+    if src.numel() == 0:
+        return psi.sum() * 0.0, psi.new_zeros(0), {k: 0.0 for k in _LOCAL_KEYS}
+
+    d = distance(psi.index_select(0, src), psi.index_select(0, dst))          # (P,)
+    # ONE-SIDED: an adjacent pair measured shorter than one step is free. A shortcut is real
+    # information about the metric and penalising it would assert the observed trace is optimal.
+    sq_deviation = (d - qrl.step_cost).relu().square().mean()
     violation = sq_deviation - qrl.local_target
+
     with torch.no_grad():
-        dd = d_step.detach()
+        dd = d.detach()
         info = {
             # THE RULER. Should pin to ~step_cost. Watch it against IMPLEMENTATION.md §9's
             # decaying `backup/delta_mean`: that is the failure this objective exists to fix.
+            # If it drifts UP, `init_lagrange_local` is the knob, not `lagrange_lr`.
             "qrl/local_dist_mean": float(dd.mean()),
             "qrl/local_dist_max": float(dd.max()),
             "qrl/local_sq_dev": float(sq_deviation),
             "qrl/local_violation": float(violation),
-            # The constraint is one-sided, so only this fraction is being pushed on at all.
             "qrl/local_over_cost_frac": float((dd > qrl.step_cost).float().mean()),
             "qrl/local_transitions": float(dd.numel()),
         }
-    return violation, d_step, info
+    return violation, d, info
+
+
+def path_violation(
+    psi: Tensor, batch: Batch, distance: Distance, qrl: QRLConfig
+) -> tuple[Tensor, Tensor, dict[str, float]]:
+    """`(violation, d, info)` for the k >= 2 rows, target read off the gap.
+
+    `E[relu(d(s_i, s_j) - (j - i) * step_cost)^2] - epsilon_path^2` over the forward
+    same-trajectory pairs with `2 <= j - i <= path_max_gap`.
+
+    **Disjoint from `local_violation` by construction** (`min_gap = 2`), which is what makes
+    two multipliers legal: nothing is counted twice, so their ratio is not underdetermined.
+    """
+    if batch.n_states == 0:
+        return psi.sum() * 0.0, psi.new_zeros(0), {k: 0.0 for k in _PATH_KEYS}
+
+    src, dst, gap = path_pairs(batch, qrl)
+    if src.numel() == 0:
+        # Also the `path_max_gap == 1` ablation, which asks for an empty set on purpose.
+        return psi.sum() * 0.0, psi.new_zeros(0), {k: 0.0 for k in _PATH_KEYS}
+
+    d = distance(psi.index_select(0, src), psi.index_select(0, dst))          # (P,)
+    target = gap.to(d.dtype) * qrl.step_cost                                  # (P,)
+    # ABSOLUTE deviation, not per-step -- see `path_max_gap` in config.py for why that choice
+    # needs the cap, and what the per-step alternative would have changed.
+    sq_deviation = (d - target).relu().square().mean()
+    violation = sq_deviation - qrl.path_target
+
+    with torch.no_grad():
+        dd, tt = d.detach(), target.detach()
+        info = {
+            "qrl/path_dist_mean": float(dd.mean()),
+            "qrl/path_dist_max": float(dd.max()),
+            # Cost per observed step, averaged over every gap in this set -- the same units as
+            # `qrl/local_dist_mean`, so the two plot on one axis. It is also the quantity a
+            # PER-STEP deviation would penalise directly; logged either way.
+            "qrl/path_ratio_mean": float((dd / tt).mean()),
+            "qrl/path_sq_dev": float(sq_deviation),
+            "qrl/path_violation": float(violation),
+            "qrl/path_over_cost_frac": float((dd > tt).float().mean()),
+            "qrl/path_pairs": float(dd.numel()),
+            # Says whether the cap is binding and whether long gaps dominate the mean.
+            "qrl/path_gap_mean": float(gap.float().mean()),
+            "qrl/path_gap_max": float(gap.max()),
+        }
+    return violation, d, info
 
 
 # ---------------------------------------------------------------------------------------
@@ -286,6 +474,12 @@ _CF_KEYS = (
     "qrl/neg_push_dist_mean",
     "qrl/neg_push_pairs",
     "qrl/neg_push_gap",
+    "qrl/pos_neg_push_dist_mean",
+    "qrl/pos_neg_push_dist_fwd_mean",
+    "qrl/pos_neg_push_dist_bwd_mean",
+    "qrl/pos_neg_push_saturated_frac",
+    "qrl/pos_neg_push_pairs",
+    "qrl/pos_neg_push_gap",
 )
 
 
@@ -330,8 +524,9 @@ def cf_terms(
     distance: Distance,
     qrl: QRLConfig,
     cf: tuple[Tensor, Tensor, Tensor, Tensor],
-) -> tuple[Tensor, Tensor, dict[str, float]]:
-    """`(cf_violation, neg_push, info)` for one micro-batch's encoded CF variants.
+) -> tuple[Tensor, Tensor, Tensor, dict[str, float]]:
+    """`(cf_violation, neg_push, pos_neg_push, info)` for one micro-batch's encoded CF
+    variants.
 
     `cf` is `(psi_variants, variant_state, variant_example, variant_kind)`. `psi_variants` is
     `psi(prompt + steps[:i] + variant + SEP)` from `cf_encode.encode_cf_psi` -- a real
@@ -341,7 +536,7 @@ def cf_terms(
     psi_v, variant_state, variant_example, variant_kind = cf
     if psi_v.numel() == 0:
         zero = psi_v.sum() * 0.0
-        return zero, zero, _empty_cf_info(qrl)
+        return zero, zero, zero, _empty_cf_info(qrl)
 
     n_examples = int(variant_example.max()) + 1
     anchor = anchor_of_example(variant_example, variant_kind, n_examples)
@@ -416,7 +611,47 @@ def cf_terms(
             neg_push = psi_v.sum() * 0.0
     else:
         neg_push = psi_v.sum() * 0.0
-    return cf_violation, neg_push, info
+
+    # ---- CF negatives pushed away from their OWN CLASS, both directions -------------
+    # The negation of the constraint above (module header, §3b). `cls` is the anchor plus its
+    # positives -- kind != 2 -- and a positive whose anchor went missing is still a positive,
+    # so this set is NOT filtered by `keep`: `anchor_missing` disqualifies a variant from
+    # being MEASURED against a hub, not from being a correct wording of the step.
+    cls = torch.nonzero(variant_kind != 2, as_tuple=False).flatten()
+    if neg.numel() and cls.numel():
+        # SAME EXAMPLE only. Across examples these are rewrites of different steps and their
+        # distance asserts nothing; pairing them would make this a second global push.
+        same_ex = (
+            variant_example.index_select(0, neg)[:, None]
+            == variant_example.index_select(0, cls)[None, :]
+        )                                                                    # (Nn, Ncls)
+        if bool(same_ex.any()):
+            # Gather the kept pairs before paying IQE's per-pair cost, exactly as the
+            # neg-vs-goal grid above does and for the same reason.
+            rows, cols = same_ex.nonzero(as_tuple=True)
+            psi_n = psi_v.index_select(0, neg.index_select(0, rows))         # (P, D)
+            psi_c = psi_v.index_select(0, cls.index_select(0, cols))         # (P, D)
+            d_fwd = distance(psi_c, psi_n)                       # correct -> broken
+            d_bwd = distance(psi_n, psi_c)                       # broken  -> correct
+            both_pn = torch.cat([d_fwd, d_bwd])
+            pos_neg_push = F.softplus(
+                qrl.softplus_offset - both_pn, beta=qrl.softplus_beta
+            ).mean()
+            with torch.no_grad():
+                bb = both_pn.detach()
+                info["qrl/pos_neg_push_dist_mean"] = float(bb.mean())
+                info["qrl/pos_neg_push_dist_fwd_mean"] = float(d_fwd.detach().mean())
+                info["qrl/pos_neg_push_dist_bwd_mean"] = float(d_bwd.detach().mean())
+                info["qrl/pos_neg_push_saturated_frac"] = float(
+                    (bb > qrl.softplus_offset).float().mean()
+                )
+                info["qrl/pos_neg_push_pairs"] = float(bb.numel())
+        else:
+            pos_neg_push = psi_v.sum() * 0.0
+    else:
+        pos_neg_push = psi_v.sum() * 0.0
+
+    return cf_violation, neg_push, pos_neg_push, info
 
 
 # ---------------------------------------------------------------------------------------
@@ -454,30 +689,37 @@ def qrl_loss(
         psi, psi_goal, distance, qrl, masks=push_masks(batch, goals)
     )
 
-    # ---- constraint 1: observed transitions cost about one step --------------------
+    # ---- constraint 1: an observed STEP costs at most step_cost ---------------------
     viol_local, _, local_info = local_violation(psi, batch, distance, qrl)
     l_local = lagrange.local(viol_local)
 
-    # ---- constraint 2: an equivalence class is one point --------------------------
+    # ---- constraint 2: an observed k-step sub-path costs at most k, k >= 2 ----------
+    viol_path, _, path_info = path_violation(psi, batch, distance, qrl)
+    l_path = lagrange.path(viol_path)
+
+    # ---- constraint 3: an equivalence class is one point --------------------------
     if cf is not None and cf[0].numel():
-        viol_cf, l_neg_push, cf_info = cf_terms(
+        viol_cf, l_neg_push, l_pos_neg_push, cf_info = cf_terms(
             psi, batch, psi_goal, goal_q, distance, qrl, cf
         )
     else:
         zero = psi.sum() * 0.0
-        viol_cf, l_neg_push, cf_info = zero, zero, _empty_cf_info(qrl)
+        viol_cf, l_neg_push, l_pos_neg_push, cf_info = zero, zero, zero, _empty_cf_info(qrl)
     l_cf = lagrange.cf(viol_cf)
 
     total = (
         l_push
         + qrl.cf_neg_push_weight * l_neg_push
+        + qrl.cf_pos_neg_push_weight * l_pos_neg_push
         + l_local
+        + l_path
         + l_cf
     )
 
     info: dict[str, float] = {}
     info.update(push_info)
     info.update(local_info)
+    info.update(path_info)
     info.update(cf_info)
     info.update(lagrange.values())
     info["qrl/neg_push_gap"] = (
@@ -485,10 +727,21 @@ def qrl_loss(
         if cf_info["qrl/neg_push_pairs"]
         else 0.0
     )
+    # Against `cf_dist_mean`, not the push mean: both sides of this subtraction are pairs of
+    # rewrites of the SAME step, so it isolates "broken" from "reworded" with the step held
+    # fixed. `cf_active` rather than `cf_pairs` guards it -- a batch can have negatives with
+    # no measurable class, and 0.0 must mean "not measured" on both readings.
+    info["qrl/pos_neg_push_gap"] = (
+        cf_info["qrl/pos_neg_push_dist_mean"] - cf_info["qrl/cf_dist_mean"]
+        if cf_info["qrl/pos_neg_push_pairs"] and cf_info["qrl/cf_active"]
+        else 0.0
+    )
     terms = {
         "push": l_push.detach(),
         "neg_push": l_neg_push.detach(),
+        "pos_neg_push": l_pos_neg_push.detach(),
         "local": l_local.detach(),
+        "path": l_path.detach(),
         "cf": l_cf.detach(),
     }
     info.update({f"loss/{k}": float(v) for k, v in terms.items()})
@@ -517,12 +770,12 @@ def expected_init_values(
       equality would fire on a correct run whose distances have any spread at all. The
       one-sided check is what is exact, and it still catches the failure that matters (a
       push term that is not the transform of its own logged distances).
-    * **`local` / `cf`** -- `lambda * violation` with the MEASURED violation. `grad_mul` is
+    * **`local` / `path` / `cf`** -- `lambda * violation` with the MEASURED violation. `grad_mul` is
       the identity in the forward pass, so these are EXACT and are asserted as equalities.
       They are the check on the multiplier plumbing: a raw scalar stored without
       `softplus_inv` starts the multiplier 70x high and this is where that shows.
-    * **`neg_push`** -- the same transform of its own logged mean, a lower bound for the same
-      Jensen reason.
+    * **`neg_push` / `pos_neg_push`** -- the same transform of their own logged means, lower
+      bounds for the same Jensen reason.
 
     There is no `dyn` row and there is no `phi` in this file (see the header): the arrived
     state is read, not predicted, so there is no latent-dynamics term to predict a value for.
@@ -536,17 +789,25 @@ def expected_init_values(
     out = {
         "push": softplus(offset - info["qrl/push_dist_mean"]),
         "local": lam["qrl/lagrange_local"] * info["qrl/local_violation"],
+        "path": lam["qrl/lagrange_path"] * info["qrl/path_violation"],
         "cf": lam["qrl/lagrange_cf"] * info["qrl/cf_violation"],
         "neg_push": (
             softplus(offset - info["qrl/neg_push_dist_mean"])
             if info["qrl/neg_push_pairs"]
             else 0.0
         ),
+        "pos_neg_push": (
+            softplus(offset - info["qrl/pos_neg_push_dist_mean"])
+            if info["qrl/pos_neg_push_pairs"]
+            else 0.0
+        ),
     }
     out["total"] = (
         out["push"]
         + qrl.cf_neg_push_weight * out["neg_push"]
+        + qrl.cf_pos_neg_push_weight * out["pos_neg_push"]
         + out["local"]
+        + out["path"]
         + out["cf"]
     )
     return out

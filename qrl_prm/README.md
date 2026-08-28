@@ -5,7 +5,11 @@ counterfactual-invariance constraint expressed in the same form, trained under F
 exact conditions.** `quasimetric-rl/` (the authors' released code) stays untouched as the
 vendored reference, the same treatment `../tmd-release/`, `../CRM/` and `../Process_Q_Model/`
 get; the pieces used here (`grad_mul`, `softplus_inv_float`, the global-push transform, the
-Lagrangian local constraint) are ported with line citations, never imported.
+Lagrangian local constraint) are ported with line citations, never imported. Two things here
+are **not** upstream's and are labelled as such wherever they appear: the local constraint is
+extended from adjacent transitions to every observed sub-path (§3.5) — under a **separate**
+multiplier, so the wide set cannot dilute the ruler — and CF negatives are pushed away from
+their own equivalence class as well as from goals (§4.5).
 
 **The row this produces is our adaptation under matched conditions, not a published QRL
 number.** Say so wherever it appears. QRL is an offline/online goal-reaching RL method on
@@ -74,7 +78,7 @@ Only `elapsed_s` may differ.
 | CF corpus size | `abl_cf_only` trained on 27,110 examples; `cf_lam2_tau005` on 36,065 | **41,380** (2026-08-25 snapshot) | the file *list* is unchanged and never needs to change — `data/cf_train/` is a snapshot that grows between runs (27,114 → 36,073 → 41,380). **This is the one condition that is NOT matched to any baseline**, and it cannot be: the corpus is bigger than either row saw. See the note below |
 | QRL's pair sampler | — | the full `S × C` grid instead of QRL's rolled batch | see §3 |
 | QRL's latent-dynamics term | — | **deleted.** `s' = s ++ a` is deterministic, so the arrived state is read — `psi[row_dst]` for an observed transition, `psi(prefix + variant)` for a rewrite — and there is nothing to predict or to police | see §4 |
-| new parameters | — | **2 scalars** (the multipliers, outside the model) + **1 scalar** (IQE's learned `alpha`, inside it) | `launch/model` reports `lagrange_params`, `distance_params` and the exact `trainable_params` at launch |
+| new parameters | — | **3 scalars** (the multipliers, outside the model) + **1 scalar** (IQE's learned `alpha`, inside it) | `launch/model` reports `lagrange_params`, `distance_params` and the exact `trainable_params` at launch |
 
 > **The CF corpus is bigger than any baseline's, and that is not fixable by config.**
 > `data/cf_train/` is a snapshot of a campaign that is still generating
@@ -130,6 +134,102 @@ Two diagnostics decide whether the term is doing anything:
   a metric whose cross-question distances grow exactly as fast as its same-trajectory ones is
   inflating a scale, not learning structure. Only the split says which.
 
+## 3.5. The two sub-path constraints — k = 1 and k ≥ 2, under separate multipliers
+
+`losses/local_constraint.py:56-59` binds **adjacent** transitions:
+
+```python
+(dist - step_cost).relu().square().mean()      # d(s_i, s_{i+1}) <= step_cost
+```
+
+That is `local_violation`, unchanged, and it is enforced on its own mean under its own
+multiplier. Beside it, `path_violation` says the same thing at wider gaps:
+
+```
+local:  E_{j=i+1}                    [ relu( d(s_i, s_j) − step_cost )² ]      ≤ epsilon_local²
+path:   E_{2 ≤ j−i ≤ path_max_gap}   [ relu( d(s_i, s_j) − (j−i)·step_cost )² ] ≤ epsilon_path²
+```
+
+**The pair sets are disjoint**, which is what makes two multipliers legal rather than one
+constraint counted twice. `tests/test_qrl.py` pins that they partition the forward pairs
+exactly, that `local_pairs` is `row_src → row_dst`, and that `--set qrl.path_max_gap=1`
+empties the path set (the local-only ablation).
+
+**Why the `k ≥ 2` rows are not redundant, even though the triangle inequality implies them.**
+For any `i < j` the observed trace *is* a path of `j − i` steps, so `d(s_i, s_j) ≤ (j−i)·c` is
+a true statement about the ground-truth quasimetric whenever each step costs at most `c` —
+exactly what `k = 1` asserts. In exact arithmetic they add nothing. In practice they are
+load-bearing, because `k = 1` is enforced **softly**, through a mean of squared deviations,
+and a mean averages a heavy tail away. Run `loj243n4`:
+
+| | |
+|---|---|
+| adjacent-step mean | 1.418 ✓ |
+| adjacent-step **max** | **6.721** ✗ |
+| fraction over cost | **0.802** ✗ |
+| same-trajectory pairs at mean gap 2.010 | measured **11.162**, implied **2.85** |
+
+The `k ≥ 2` rows measure that leak instead of hoping the bound propagates through it.
+
+### Why they are two constraints and not one mean
+
+They *were* one mean, in probe `0lcrduzl`, and the merge is what this split undoes. A mean
+divides by every pair; a **one-sided** constraint leaves most of a wide set at exactly zero.
+Step 1 of `0lcrduzl` against `1wbpyf2g` on the identical seed-42 batch:
+
+| set | pairs | violating | Σ dev² | mean |
+|---|---|---|---|---|
+| k = 1 | 489 | 486 (99.4%) | 969.4 | **1.982** |
+| k ≥ 2 | 3,119 | 418 (13.4%) | 226.3 | 0.073 |
+| pooled | 3,608 | 904 (25.1%) | 1,195.7 | 0.331 |
+
+The `k = 1` rows carried **81% of the violation** and received **489/3608 = 13.5% of the
+weight**. Over 20 steps `local_dist_mean` went **2.263 → 3.009** where the same multiplier on
+the `k = 1` constraint alone had taken it **2.263 → 1.390**. The pooled mean also loosened ε:
+`sq_dev ≤ 0.0625` over 3,608 pairs lets adjacent steps sit at **d = 1.68** rather than 1.25.
+
+The "N cancels" argument for merging — each state is in `2N/S` pairs and the term divides by
+`N`, so the per-state gradient is `4λε/S` — is right **at equilibrium** and wrong **in the
+transient**, where slack pairs are 0 in the numerator and full weight in `N`.
+
+**One-sided at every k.** `relu` means a sub-path the metric already measures as *shorter*
+than its observed length is free. That is not slack, it is correctness: the observed trace need
+not be the shortest path between its own endpoints, and penalising `d < k` would assert that
+it is. It is also why starting `init_lagrange_local` high is safe — no multiplier can crush
+distances below the observed path length.
+
+**Forward pairs only.** `d` is a *quasi*metric. There is no observed path back up a reasoning
+trace, so `d(s_j, s_i)` for `j > i` *should* be large and constraining it would assert the
+opposite.
+
+### The cap, and why the deviation is absolute
+
+`path_max_gap: 3`. The deviation is **absolute**, `(d − k·c)⁺`, so at gap `k` a metric
+inflated to `d ≈ 3k` deviates by `2k` and `dev² ≈ 4k²` — one gap-20 pair carries **100×** what
+a gap-2 pair does. Uncapped (`path_gap_max` was 20 on `0lcrduzl`) the k ≥ 2 mean would be
+steered by the longest sub-paths, which is *"the constraint controlled the mean, not the tail"*
+relocated one level up, and aimed at the wrong gaps: `loj243n4`'s damage was at
+`probe16/goal_offset_mean` **2.010**, i.e. `k ≈ 2`.
+
+The cap also **concentrates** the violation, which is what makes `init_lagrange_path`
+meaningful. Uncapped, the k ≥ 2 violation at step 1 is **+0.010** — already satisfied, nothing
+to integrate. Capped at `k ≤ 3` it is **~+0.202**, 20× more, from the same pairs.
+
+The alternative is a **per-step** deviation, `((d − k·c)⁺/k)²`, which makes every gap
+contribute in the same units and needs no cap. Considered and not taken: it changes what
+`epsilon_path` asserts, and the absolute form is upstream's. `qrl/path_ratio_mean` logs the
+per-step quantity either way.
+
+### Which gaps carry the violation flips during a run
+
+On an untrained ψ the distance barely grows with the gap (~3.3 at every `k`, measured), so
+against a target of `k·step_cost` the *short* gaps carry the whole violation and anything past
+`k ≈ 3` is already slack — `λ_path` sits armed rather than working. Once the push has expanded
+same-trajectory pairs it inverts: `loj243n4`'s gap-2 pairs at 11.16 contribute
+`(11.16−2)² = 84` against a gap-1 pair's `(1.418−1)² = 0.17`. Splitting the means is exactly
+what keeps that inversion out of the `k = 1` constraint, and
+**`qrl/local_dist_mean` stays THE ruler throughout.**
+
 ## 4. The CF constraint — the star topology, and what grounds φ to ψ
 
 A CF example attaches at departure state `h_{i−1}`, and `φ(h_{i−1}, act(variant))` is the
@@ -171,6 +271,35 @@ sources instead: `d(φ(neg), ψ_g)` against same-question goal columns, which is
 eval-aligned direction (a broken state as the source of the query). `qrl/neg_push_gap` —
 their mean distance minus the overall push mean — is the curve that says whether that is
 working.
+
+### 4.5. Pushing broken rewrites away from the class — the constraint's negation
+
+The CF constraint says a meaning-**preserving** rewrite of step `i` is the same point as the
+original. Nothing said a meaning-**breaking** rewrite of that step is a *different* one, and
+`neg_push` does not say it either: that term is a claim about reaching the **answer**, and a
+metric can hold `d(neg, goal)` large while still stacking the broken rewrite on top of the
+correct one. At which point a paraphrase-sized perturbation moves a step across the verdict
+boundary — failure (4) again, from the other side.
+
+So every negative is also pushed away from **its own class**: the anchor and its positives,
+same CF example, **both directions**, exactly as the constraint binds both.
+
+```
+cf_pos_neg_push_weight · mean over { softplus(offset − d(c, n)), softplus(offset − d(n, c)) }
+        for every class member c and negative n of the SAME example
+```
+
+**Same example only** — a negative and a positive from different examples are rewrites of
+*different* steps, so their distance asserts nothing, and pairing them would quietly make this
+a second global push with a CF-shaped sampler. A positive whose anchor went missing is still a
+class member: `cf_anchor_missing` disqualifies a variant from being *measured against a hub*,
+not from being a correct wording of the step.
+
+`qrl/pos_neg_push_gap` = `pos_neg_push_dist_mean − cf_dist_mean` is the curve to read. Both
+sides are pairs of rewrites of the **same step**, so it isolates "broken" from "reworded" with
+the step held fixed — which the global push mean, taken over unrelated questions, cannot do.
+It should **open**. `--set qrl.cf_pos_neg_push_weight=0` makes the term an exact zero with the
+diagnostics still logged.
 
 `epsilon_cf: 0.2` is not QRL's; it is chosen against **the ruler a verdict is read against**.
 The old margin ruler is `2 log 2 ≈ 1.386` (§7.6), so a 0.2 ball keeps a paraphrase ~7× too
@@ -222,12 +351,16 @@ head state dict — raw, pre-softplus, so a reload is exact.
 
 | key | read it as |
 |---|---|
-| **`qrl/local_dist_mean`** | **THE RULER.** Should pin near `step_cost = 1.0`. This is the direct answer to IMPLEMENTATION.md §9's decaying `backup/delta_mean` — watch it against that history |
-| `qrl/lagrange_local`, `qrl/lagrange_cf` | must **rise then stabilise**. Monotone climbing while the matching violation does not fall = the constraint cannot be satisfied. For λ_cf that means the CF corpus contradicts itself |
-| `qrl/local_violation`, `qrl/cf_violation` | the **sign** is the readable quantity: negative = satisfied |
+| **`qrl/local_dist_mean`** | **THE RULER** — a mean over the transitions **alone**, which is the point of the split. Should pin near `step_cost = 1.0`; the direct answer to IMPLEMENTATION.md §9's decaying `backup/delta_mean`. Drifting **up** = `λ_local` is losing → raise `init_lagrange_local`, not `lagrange_lr` |
+| `qrl/local_over_cost_frac`, `qrl/local_transitions` | reaching **1.000** means every adjacent pair is over budget. `local_transitions` must equal the batch's transition count |
+| **`qrl/path_ratio_mean`** | cost per observed step at `k ≥ 2`, same units as the ruler so they plot together. The ruler near 1.0 with this far above it is the exact failure §3.5 exists to catch. `loj243n4` read **5.6** |
+| `qrl/path_gap_mean`, `qrl/path_gap_max` | says whether the cap is binding and whether long gaps dominate the mean |
+| `qrl/lagrange_local`, `qrl/lagrange_path`, `qrl/lagrange_cf` | must **rise then stabilise**, or settle downward from their inits. Monotone climbing while the matching violation does not fall = the constraint cannot be satisfied. For λ_cf that means the CF corpus contradicts itself |
+| `qrl/local_violation`, `qrl/path_violation`, `qrl/cf_violation` | the **sign** is the readable quantity: negative = satisfied. At init `local` is strongly positive and `path` is near zero — that asymmetry is why they are split |
 | `qrl/cf_p95` | the tail, not the mean. A class whose mean sits inside `epsilon_cf` can still hold pairs far outside it, and those are the paraphrases that flip a verdict (§7.12's lesson, in a different loss) |
 | `qrl/push_saturated_frac` | rising to 1.0 = the push term has no gradient left |
 | `qrl/neg_push_gap` | CF negatives' distance to goals minus the overall push mean. It should **open** |
+| **`qrl/pos_neg_push_gap`** | how much further a **broken** rewrite of a step sits than a **reworded** one (§4.5). Both sides are rewrites of the same step, so this isolates the property from the scale. It should **open**; flat means the metric is separating scale, not meaning |
 | `qrl/cf_active`, `qrl/cf_hub_missing` | 0.0 / non-zero says "no data this batch" rather than "violation happened to be zero" — the empty path logs the full key set at 0.0 and never vanishes |
 | **`probe14/*`** | the three-way Δ histogram, "the single best predictor of ProcessBench F1" (§7.6.6). Computed by `build_matrices` + `batch_probes` **verbatim**, under `no_grad`, on log steps only — so the QRL row's numbers mean exactly what `abl_cf_only`'s and `pqm_zeta4`'s do. No QRL term reads those tensors |
 

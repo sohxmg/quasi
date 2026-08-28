@@ -21,7 +21,7 @@ Three mechanics, all of them load-bearing:
   `+lambda * violation` and descend it, while `raw` sees `-violation` and therefore ASCENDS
   the violation -- exactly `max_lambda min_theta`. Writing `-lambda * violation` instead
   would flip the primal's sign too, which trains the model to violate its own constraints.
-* **`softplus_inv_float` at init.** `init_lagrange` is stated as the MULTIPLIER's value, so
+* **`softplus_inv_float` at init.** `init_lagrange_*` is stated as the MULTIPLIER's value, so
   the raw scalar has to be its inverse-softplus. Storing 0.01 raw would start the multiplier
   at `softplus(0.01) = 0.698`, 70x the intended value, and nothing downstream would say so.
 
@@ -122,27 +122,63 @@ class LagrangeMultiplier(nn.Module):
 
 
 class LagrangeMultipliers(nn.Module):
-    """The two dual variables of this run, in one module so the second optimiser is built
+    """The three dual variables of this run, in one module so the second optimiser is built
     from `.parameters()` and cannot miss one.
 
+    **Three, not two, and the third is a SPLIT rather than an addition.** `local` is the
+    observed-transition constraint at k = 1 (`losses/local_constraint.py`, unchanged) and
+    `path` is the observed-sub-path constraint at `2 <= k <= path_max_gap`. The two pair sets
+    are DISJOINT, so nothing is counted twice -- which is what makes two multipliers legal
+    here. A `path` set that included k = 1 would be the same constraint under two multipliers
+    whose ratio nothing determines, and that is the merge this split undoes.
+
+    **Why they were split back apart.** Both terms are means of squared deviations, and the
+    constraint is ONE-SIDED, so a mean divides by pairs that contribute exactly zero. Measured
+    at step 1 of probe `0lcrduzl` against `1wbpyf2g` on the identical seed-42 batch: the 489
+    adjacent pairs carried 969.4 of the 1,195.7 total squared deviation (81%) and received
+    489/3608 = 13.5% of the weight. `local_dist_mean` went 2.263 -> 3.009 over 20 steps where
+    the same multiplier on the k = 1 constraint alone had taken it 2.263 -> 1.390. The
+    "N cancels" argument for merging is right at EQUILIBRIUM -- `(2N/S) * 2*lambda*eps / N` --
+    and wrong in the TRANSIENT, where slack pairs are 0 in the numerator and full weight in N.
+
     `state_dict()` / `load_state_dict()` are what the checkpoint payload carries: a resumed
-    run that restarted its multipliers at `init_lagrange` would spend the first ~100 steps
+    run that restarted its multipliers at their init values would spend the first ~100 steps
     re-climbing to wherever they had settled, on a primal that is already trained -- a
     transient that looks exactly like a bad resume and is not one.
+
+    **`raw_values()` has changed key set twice now: `{local, cf}` -> `{path, cf}` -> `{local,
+    path, cf}`.** A resume path must FAIL on either older key set rather than fall back to it.
+    The dangerous one is the middle spelling, because it uses a name this class still holds
+    while meaning something else: `path` was the equilibrium of a mean over EVERY
+    same-trajectory pair, and `path` here is the equilibrium of a mean over `k >= 2` only,
+    under a `local` that now takes the k = 1 rows. The two are numerically close by the
+    N-cancels argument above, which is exactly what would make a silent fallback hard to spot.
+
+    The three inits are SEPARATE arguments and there is no shared default, which is deliberate.
+    QRL starts all of its multipliers at 0.01 (`local_constraint.py:31`) because it trains for
+    2e5 steps; at the ~1,464 this run gets, a multiplier cannot reach its equilibrium in time
+    and the primal spends the first 40% of training under a push term with nothing opposing it.
+    `qrl_prm/config.py` carries the measurement behind each of the three values.
     """
 
-    def __init__(self, init_value: float = 0.01):
+    def __init__(self, init_local: float, init_path: float, init_cf: float):
         super().__init__()
-        self.local = LagrangeMultiplier(init_value)
-        self.cf = LagrangeMultiplier(init_value)
+        self.local = LagrangeMultiplier(init_local)
+        self.path = LagrangeMultiplier(init_path)
+        self.cf = LagrangeMultiplier(init_cf)
 
     def values(self) -> dict[str, float]:
         return {
             "qrl/lagrange_local": float(self.local.value.detach()),
+            "qrl/lagrange_path": float(self.path.value.detach()),
             "qrl/lagrange_cf": float(self.cf.value.detach()),
         }
 
     def raw_values(self) -> dict[str, float]:
         """The RAW scalars, for the checkpoint payload. Saved raw rather than post-softplus
         so a reload is exact rather than round-tripped through `softplus_inv`."""
-        return {"local": float(self.local.raw.detach()), "cf": float(self.cf.raw.detach())}
+        return {
+            "local": float(self.local.raw.detach()),
+            "path": float(self.path.raw.detach()),
+            "cf": float(self.cf.raw.detach()),
+        }

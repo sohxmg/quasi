@@ -50,6 +50,9 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import faulthandler
+import os
+import signal
 from pathlib import Path
 
 import torch
@@ -188,7 +191,7 @@ def check_init_values(qrl: QRLConfig, terms, info: dict, expected: dict) -> None
       on healthy runs stops being read).
     """
     actual = {k: float(v) for k, v in terms.items()}
-    for name in ("local", "cf"):
+    for name in ("local", "path", "cf"):
         assert abs(actual[name] - expected[name]) <= max(
             INIT_TOLERANCE, INIT_TOLERANCE * abs(expected[name])
         ), (
@@ -197,7 +200,7 @@ def check_init_values(qrl: QRLConfig, terms, info: dict, expected: dict) -> None
             f"mismatch means the multiplier is not softplus(raw) (check softplus_inv at init) "
             f"or the violation is not the one being logged."
         )
-    for name in ("push", "neg_push"):
+    for name in ("push", "neg_push", "pos_neg_push"):
         assert actual[name] >= expected[name] - INIT_TOLERANCE, (
             f"{name} {actual[name]:.8f} is BELOW its Jensen lower bound "
             f"{expected[name]:.8f} (§18). softplus is convex, so "
@@ -341,8 +344,10 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             "these overrides are silently INERT under qrl_prm/ -- nothing here reads "
             f"`losses.*`: {', '.join(stray)}.\n"
-            "QRL has no fixed lambdas: the two weights are LEARNED Lagrange multipliers "
-            "(qrl.init_lagrange, qrl.lagrange_lr). Did you mean a `qrl.*` knob? "
+            "QRL has no fixed lambdas: the three weights are LEARNED Lagrange multipliers "
+            "(qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf, "
+            "qrl.lagrange_lr). Did you mean a "
+            "`qrl.*` knob? "
             f"Legal: {', '.join(sorted(f.name for f in dataclasses.fields(QRLConfig)))}"
         )
 
@@ -389,6 +394,7 @@ def main(argv: list[str] | None = None) -> int:
         {
             **{f"qrl/{k}": v for k, v in qrl.to_dict().items()},
             "qrl/local_target": qrl.local_target,
+            "qrl/path_target": qrl.path_target,
             "qrl/cf_target": qrl.cf_target,
             "distance/variant": cfg.distance.variant,
             "distance/components": cfg.distance.components,
@@ -454,7 +460,9 @@ def main(argv: list[str] | None = None) -> int:
     model.to(device)
     model.train()   # must precede the memory probe: eval mode disables gradient checkpointing
 
-    lagrange = LagrangeMultipliers(qrl.init_lagrange).to(device)
+    lagrange = LagrangeMultipliers(
+        qrl.init_lagrange_local, qrl.init_lagrange_path, qrl.init_lagrange_cf
+    ).to(device)
 
     # ---- the CF corpus. THE IDENTICAL PATH ---------------------------------------------
     # Ported from `feynman_prm/train.py` with one change: there, the `prefix_hash` guard is
@@ -538,6 +546,7 @@ def main(argv: list[str] | None = None) -> int:
                 "rows": len(rows),
                 "epsilon_cf": qrl.epsilon_cf,
                 "cf_neg_push_weight": qrl.cf_neg_push_weight,
+                "cf_pos_neg_push_weight": qrl.cf_pos_neg_push_weight,
                 **cf_split_info,
             },
         )
@@ -690,6 +699,31 @@ def main(argv: list[str] | None = None) -> int:
         },
     )
 
+    # ---- the stall watchdog ------------------------------------------------------------
+    # 2026-08-26: a run wedged mid-micro-batch burning one core at 100% with ZERO syscalls,
+    # and Ctrl-C could not touch it -- SIGINT is only delivered between bytecode ops, so a
+    # process inside one long C/Rust call never sees it. The only recoverable evidence was a
+    # stack, and `py-spy`/`gdb` both need ptrace, which we do not have on the box.
+    #
+    # `dump_traceback_later` runs off a DEDICATED C thread, so it fires regardless of the GIL
+    # or of what extension is running. Re-armed at the top of every micro-batch (each call
+    # cancels the pending timer), so it only fires when ONE micro-batch overruns -- not on a
+    # slow run. `exit=False`: dump and keep going, in case it is merely slow.
+    #
+    # `faulthandler.register(SIGUSR1)` is the manual version: `kill -USR1 <pid>` for a stack
+    # on demand. It has SIGINT's limitation and may not land mid-C-call, which is exactly why
+    # the timer above exists as well and is not redundant with it.
+    watchdog_s = float(os.environ.get("QRL_WATCHDOG_S", "300"))
+    if watchdog_s > 0:
+        faulthandler.enable()
+        try:
+            faulthandler.register(signal.SIGUSR1)
+        except (AttributeError, ValueError):
+            pass  # not POSIX, or no stderr to write to
+        print(f"[watchdog] arming at {watchdog_s:.0f}s per micro-batch; "
+              f"`kill -USR1 {os.getpid()}` for a stack on demand. "
+              f"QRL_WATCHDOG_S=0 disables.", flush=True)
+
     # ---- train -------------------------------------------------------------------------
     step = 0
     checked_init = False
@@ -698,6 +732,10 @@ def main(argv: list[str] | None = None) -> int:
         if epoch > 0:
             batches = epoch_batches(rows, slots, cfg, epoch, epoch_rng(cfg.run.seed, epoch))
         for micro, batch_rows in enumerate(batches):
+            if watchdog_s > 0:
+                # Re-arm: cancels the pending timer and starts a fresh one, so the deadline is
+                # per-micro-batch. A dump here names the exact line the step wedged on.
+                faulthandler.dump_traceback_later(watchdog_s, repeat=False, exit=False)
             batch, goals, reps, out = run_micro_batch(
                 model, rows, batch_rows, cfg, qrl, lagrange, device,
                 goal_rng(cfg.run.seed, epoch, micro), cf_ctx=cf_ctx,
@@ -723,23 +761,44 @@ def main(argv: list[str] | None = None) -> int:
                         "push_dist_mean": round(out.info["qrl/push_dist_mean"], 4),
                         "push_saturated_frac": round(out.info["qrl/push_saturated_frac"], 4),
                         "local_dist_mean": round(out.info["qrl/local_dist_mean"], 4),
+                        "local_over_cost_frac": round(
+                            out.info["qrl/local_over_cost_frac"], 4
+                        ),
+                        "local_transitions": out.info["qrl/local_transitions"],
                         "local_violation": round(out.info["qrl/local_violation"], 6),
+                        "path_dist_mean": round(out.info["qrl/path_dist_mean"], 4),
+                        "path_ratio_mean": round(out.info["qrl/path_ratio_mean"], 4),
+                        "path_gap_max": out.info["qrl/path_gap_max"],
+                        "path_pairs": out.info["qrl/path_pairs"],
+                        "path_violation": round(out.info["qrl/path_violation"], 6),
                         "cf_violation": round(out.info["qrl/cf_violation"], 6),
                         "cf_pairs": out.info["qrl/cf_pairs"],
                         "cf_positives": out.info["qrl/cf_positives"],
                         "cf_anchor_missing": out.info["qrl/cf_anchor_missing"],
                         "cf_encode_sequences": out.info["cf/encode_sequences"],
+                        "pos_neg_push_dist_mean": round(
+                            out.info["qrl/pos_neg_push_dist_mean"], 4
+                        ),
+                        "pos_neg_push_pairs": out.info["qrl/pos_neg_push_pairs"],
+                        "pos_neg_push_gap": round(out.info["qrl/pos_neg_push_gap"], 4),
                         "lagrange_local": round(out.info["qrl/lagrange_local"], 6),
+                        "lagrange_path": round(out.info["qrl/lagrange_path"], 6),
                         "lagrange_cf": round(out.info["qrl/lagrange_cf"], 6),
                         "note": (
-                            "push is a LOWER bound (softplus is convex: mean(f) >= f(mean)); "
-                            "the constraint terms are EXACT. At init psi is a random map over "
-                            "anisotropic LM hiddens, so local_dist_mean starts far above "
-                            "step_cost = 1 and local_violation starts strongly POSITIVE -- "
-                            "that is correct and it is why lambda_local must rise before it "
-                            "falls. push_saturated_frac near 1.0 at init would mean "
-                            "softplus_offset is below the untrained distance scale and the "
-                            "push term has no gradient; raise the offset, do not proceed."
+                            "the push terms are LOWER bounds (softplus is convex: "
+                            "mean(f) >= f(mean)); the constraint terms are EXACT. At init psi "
+                            "is a random map over anisotropic LM hiddens, so "
+                            "local_dist_mean starts far above step_cost = 1 and "
+                            "local_violation starts strongly POSITIVE -- that is correct and "
+                            "it is why lambda_local is initialised at its destination rather "
+                            "than climbed to. local_transitions must equal the transition "
+                            "count. path_violation starts NEAR ZERO by contrast: on an "
+                            "untrained psi the distance barely grows with the gap, so the "
+                            "k >= 2 rows are mostly slack and lambda_path sits armed rather "
+                            "than working -- that is the regime the split exists to keep out "
+                            "of the k = 1 mean. push_saturated_frac near 1.0 at init would "
+                            "mean softplus_offset is below the untrained distance scale and "
+                            "the push term has no gradient; raise the offset, do not proceed."
                         ),
                     },
                 )
@@ -789,6 +848,11 @@ def main(argv: list[str] | None = None) -> int:
                     break
         if stop:
             break
+
+    # Disarmed before the final save: a checkpoint write is legitimately slow and a dump here
+    # would be noise on a healthy run.
+    if watchdog_s > 0:
+        faulthandler.cancel_dump_traceback_later()
 
     # ---- the B6 guard, and the checkpoint it is not allowed to eat ----------------------
     # Read the LR over the WHOLE run, never start-vs-end: LambdaLR's constructor applies
